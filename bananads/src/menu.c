@@ -149,6 +149,9 @@ static const char *const IC_LOAD[12] = { "............", ".####.......", "#....#
     "#....##....#", "#..######..#", "#...####...#", "#....##....#", "#..........#", "############" };
 static const char *const IC_SLIDERS[12] = { "............", "..##........", "############", "..##........", "............", "........##..",
     "############", "........##..", "............", ".....##.....", "############", ".....##....." };
+/* LAN multiplayer: the Wi-Fi arcs */
+static const char *const IC_LAN[12] = { "............", "...######...", ".##......##.", "#...####...#", "..##....##..", ".#...##...#.",
+    "....#..#....", ".....##.....", ".....##.....", "............", "............", "............" };
 static const char *const IC_LIST[12] = { "............", "##.#########", "##.#########", "............", "............", "##.#########",
     "##.#########", "............", "............", "##.#########", "##.#########", "............" };
 static const char *const IC_EXIT[12] = { "######......", "#....#......", "#....#...#..", "#....#...##.", "#....#######", "#....#######",
@@ -525,7 +528,8 @@ static void load_wav(int id, const char *path) {
 static void play(int id) { if (snd_ok[id] && H.sound_play) H.sound_play(H.ctx, id); }
 
 /* ---------- state ---------- */
-enum { SC_MAIN, SC_SAVE, SC_LOAD, SC_SET, SC_QUIT, SC_OVERWRITE, SC_BUSY, SC_MIC, SC_RESTART, SC_CHEAT, SC_QUIT_NOSAVE, SC_KEYS };
+enum { SC_MAIN, SC_SAVE, SC_LOAD, SC_SET, SC_QUIT, SC_OVERWRITE, SC_BUSY, SC_MIC, SC_RESTART, SC_CHEAT, SC_QUIT_NOSAVE, SC_KEYS,
+       SC_LAN, SC_LAN_HOSTS, SC_LAN_LEAVE, SC_LAN_SWITCH };
 static int enabled = -1, inited, open_, scr, sel_main, sel_slot, sel_set, dirty_top, dirty_bot;
 #define MAIN_BRI 6                                /* sel_main: the main page's Brightness row, under the tiles */
 static int main_col;                              /* the tiles' column the d-pad came down from (back up to it) */
@@ -535,16 +539,24 @@ static uint32_t *bgtop;                         /* the game's top frame, dimmed 
 static canvas CV[2];
 static int pw[2], ph[2];
 
+/* H.live: the game keeps running behind the menu (a local wireless game: pausing it would drop the other handhelds).
+ * Then the game's input is neutral, its picture behind the menu is the frame from the moment it opened, its sound
+ * goes on, and everything that touches the running game is off (Save, Load, Restart game, Cheats). Asked again every
+ * 250 ms: once the frontend has paused the game (the local game over), the menu is the usual paused one */
+static int live_;
+
 /* rows of Quick settings that exist on this setup */
-enum { ROW_VOL, ROW_BRI, ROW_MIC, ROW_CHEAT, ROW_OPT = 100 };   /* ROW_OPT + i: the emulator's option i (bmenu_host's opt_*) */
-static int rows[8], nrows;
+enum { ROW_VOL, ROW_BRI, ROW_MIC, ROW_CHEAT, ROW_LAN, ROW_OPT = 100 };   /* ROW_OPT + i: the emulator's option i (bmenu_host's opt_*) */
+#define MAX_ROWS 10
+static int rows[MAX_ROWS], nrows;
 #define CHEAT_ROWS 7                            /* the Cheats page's rows on screen at once */
 static int sel_cheat, top_cheat;
 static void make_rows(void) {
     nrows = 0; rows[nrows++] = ROW_VOL; rows[nrows++] = ROW_BRI; rows[nrows++] = ROW_MIC;
     if (H.cheat_count) rows[nrows++] = ROW_CHEAT;
+    { static bmenu_lan probe; if (H.lan_get && H.lan_get(H.ctx, &probe)) rows[nrows++] = ROW_LAN; }
     int n = H.opt_count ? H.opt_count(H.ctx) : 0;
-    for (int i = 0; i < n && nrows < 8; i++) rows[nrows++] = ROW_OPT + i;
+    for (int i = 0; i < n && nrows < MAX_ROWS; i++) rows[nrows++] = ROW_OPT + i;
 }
 
 static int fonts_ready(void) {   /* the menu's and the pop-ups' fonts, loaded once */
@@ -706,7 +718,7 @@ static void draw_top(void) {
     } else {
         /* PAUSED pill, the game, its genre */
         int cw = x1 - L - S(28);
-        const char *paused = lang_active() ? "Paused" : "PAUSED";   /* (the translator's line is "Paused") */
+        const char *paused = live_ ? (lang_active() ? "Running" : "RUNNING") : lang_active() ? "Paused" : "PAUSED";   /* (the translator's lines are "Paused", "Running") */
         float pwid = text_w(&F_MED, paused, S(14), 99) + S(18);
         rrect(c, L, S(68), L + (int)pwid, S(68) + S(24), S(4), C_LIGHT, 1.0f);
         text(c, &F_MED, paused, L + S(9), S(71), S(14), C_DARK, 0, 0);
@@ -740,7 +752,7 @@ static void draw_top(void) {
             y += S(16);
             text(c, &F_MED, "BUTTONS", L, y, S(14), C_TEALTXT, 0, 0);
             y += S(28);
-            static const char *const keys[][2] = { { "F / L3", "this menu" }, { "F + R", "save to slot 1" },
+            static const char *const keys[][2] = { { "MENU", "this menu" }, { "F + R", "save to slot 1" },
                                                    { "F + L", "load slot 1" }, { "F + START", "save your spot and quit" } };
             for (int i = 0; i < 4 && y + S(24) <= y1 - S(12); i++, y += S(30)) {
                 float kw = text_w(&F_MED, keys[i][0], S(15), 99) + S(14);
@@ -780,7 +792,7 @@ static void draw_top(void) {
 
 /* ---------- bottom panel ---------- */
 typedef struct { int x0, y0, x1, y1; } rect;
-static rect R_TILE[6], R_SLOT[NSLOT], R_ROW[8], R_BAR[8], R_FOOT_L, R_FOOT_R, R_HEAD_B, R_DLG_B, R_DLG_A, R_DLG_X, R_UNDO, R_MBRI, R_MBRI_BAR, R_KEYS;
+static rect R_TILE[6], R_SLOT[NSLOT], R_ROW[MAX_ROWS], R_BAR[MAX_ROWS], R_FOOT_L, R_FOOT_R, R_HEAD_B, R_DLG_B, R_DLG_A, R_DLG_X, R_UNDO, R_MBRI, R_MBRI_BAR, R_KEYS;
 static int in_rect(rect r, int x, int y) { return x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1; }
 
 static void keycap(canvas *c, int x, int y, int sz, const char *k) {   /* the theme's light square with a button letter */
@@ -800,6 +812,85 @@ static rect pill(canvas *c, int x, int y, int right, const char *k, const char *
 }
 static const char *const IC_RESTART[12] = { "............", "....####.#..", "...#....##..", "..#....###..", ".#..........", ".#..........",
     ".#..........", ".#........#.", "..#......#..", "...#....#...", "....####....", "............" };
+/* a local wireless game (H.mp_lock, looked at as the menu opens): Save, Load and Restart game are off, the
+ * session would break (a load or a restart drops the other handhelds, and the game can't take its state back);
+ * Resume, Quick settings and Quit game stay. off_note_until: the reason in the header for a moment, after A on one */
+static int mp_locked;
+static long long off_note_until;
+static int tile_off(int i) { return mp_locked && (i == 1 || i == 2 || i == 4); }
+static int cheats_off(void) { return mp_locked; }   /* a code changes the game the other handhelds play with */
+
+/* LAN multiplayer (Quick settings > LAN multiplayer): wifi.local from the menu. The frontend reports the state (H.lan_get,
+ * looked at twice a second while a LAN page is open) and carries out a mode change (H.lan_set) on the emulator's
+ * thread, so the menu never waits on the network: a join shows "Connecting" until it is done. Modes change only
+ * outside a local wireless game; in one, Disconnect is all there is (in Auto, Off; the others' game shows its own
+ * error). The pages: SC_LAN (Mode, Players (Host), Hosts found (Join), Disconnect (Host and Join), and the state),
+ * SC_LAN_HOSTS (the hosts on the network, a scrolling list as Cheats'), SC_LAN_LEAVE (are you sure, in a local
+ * wireless game), SC_LAN_SWITCH (another mode while others are in the session: are you sure). Each mode's rows show
+ * only with that mode on the Mode row: Hosts found (Join), Disconnect (the mode that is on). Auto has no Players (a session it hosts has Host's size, wifi.local_players) and no Disconnect:
+ * Off leaves (the others hear it at once), Auto again starts afresh */
+static bmenu_lan LS;
+static int lan_pick, lan_max_pick, sel_lan, sel_host, top_host, lan_joining;
+static long long lan_polled;
+static const char *const lan_mode_name[BM_LAN_MODES] = { "Off", "Host", "Join", "Auto" };
+static const int lan_cycle[BM_LAN_MODES] = { BM_LAN_OFF, BM_LAN_AUTO, BM_LAN_HOST, BM_LAN_JOIN };   /* the Mode row's order */
+static int lan_hosting(void) { return LS.mode == BM_LAN_HOST || (LS.mode == BM_LAN_AUTO && LS.phase == BM_AUTO_HOST); }
+enum { LR_MODE, LR_PLAYERS, LR_HOSTS, LR_LEAVE };
+static int lrows[4], nlrows;
+static int lan_locked(void) { return live_ || (H.mp_lock && H.mp_lock(H.ctx)); }   /* a local wireless game is on */
+/* Auto in a local wireless game: the Mode row offers Off (asked first, as a Disconnect), nothing else */
+/* others in the session (a host's guests, or a host we joined): another mode asks first (SC_LAN_SWITCH) */
+static int lan_with_others(void) { return LS.state == BM_LAN_READY && (LS.nplayers > 1 || !lan_hosting()); }
+static int lan_auto_off_only(void) { return LS.mode == BM_LAN_AUTO && !LS.no_net && lan_locked(); }
+static int lan_poll(void) {   /* the frontend's state into LS; 1: it changed */
+    static bmenu_lan n;
+    memset(&n, 0, sizeof n);
+    if (!H.lan_get || !H.lan_get(H.ctx, &n)) return 0;
+    lan_polled = now_ms();
+    static int was_locked;   /* a local wireless game starting or ending changes the page too */
+    const int lk = lan_locked(), lk_changed = lk != was_locked;
+    was_locked = lk;
+    if (!memcmp(&n, &LS, sizeof n)) return lk_changed;
+    LS = n; return 1;
+}
+static void lan_rows(void) {
+    nlrows = 0; lrows[nlrows++] = LR_MODE;
+    if (lan_pick == BM_LAN_HOST) lrows[nlrows++] = LR_PLAYERS;   /* (the Mode row on Host; greyed till Host is on) */
+    if (lan_pick == BM_LAN_JOIN && LS.mode == BM_LAN_JOIN && LS.state != BM_LAN_READY) lrows[nlrows++] = LR_HOSTS;
+    if (lan_pick == LS.mode && (LS.mode == BM_LAN_HOST || LS.mode == BM_LAN_JOIN) && LS.state == BM_LAN_READY) lrows[nlrows++] = LR_LEAVE;
+    if (sel_lan >= nlrows) sel_lan = nlrows - 1;
+}
+static void lan_open(void) {   /* Quick settings > LAN multiplayer */
+    lan_poll(); lan_pick = LS.mode; lan_max_pick = LS.host_players >= 2 ? LS.host_players : 4; sel_lan = 0; lan_joining = 0;
+    lan_rows();
+}
+/* the Players row (Host): the session's size, set once Host is on, while alone in it; Auto uses it too */
+static int lan_players_off(void) { return LS.mode != BM_LAN_HOST || lan_locked() || LS.no_net || LS.nplayers > 1; }
+static const char *lan_short(char *v, size_t n) {   /* Quick settings' value for the row */
+    if (LS.no_net) snprintf(v, n, "No Wi-Fi");
+    else if (LS.mode == BM_LAN_OFF) snprintf(v, n, "Off");
+    else if (LS.mode == BM_LAN_AUTO) {
+        switch (LS.phase) {
+        case BM_AUTO_SEARCH: snprintf(v, n, "Auto, looking..."); break;
+        case BM_AUTO_JOINING: snprintf(v, n, "Auto, joining..."); break;
+        case BM_AUTO_HOST: snprintf(v, n, "Auto: host, %d of %d", LS.nplayers, LS.max_players); break;
+        case BM_AUTO_JOINED: snprintf(v, n, "Auto: joined, %d of %d", LS.nplayers, LS.max_players); break;
+        case BM_AUTO_ONLINE: snprintf(v, n, "Auto, online (WFC)"); break;
+        case BM_AUTO_HELD: snprintf(v, n, "Auto, stopped"); break;
+        default: snprintf(v, n, "Auto, waiting"); break;
+        }
+    }
+    else if (LS.state == BM_LAN_FAILED) snprintf(v, n, "Problem");
+    else if (LS.state == BM_LAN_BUSY) snprintf(v, n, LS.mode == BM_LAN_HOST ? "Starting..." : LS.addr[0] ? "Connecting..." : "Looking...");
+    else if (LS.mode == BM_LAN_HOST) snprintf(v, n, "Host, %d of %d", LS.nplayers, LS.max_players);
+    else if (LS.state == BM_LAN_READY) snprintf(v, n, "Joined, %d of %d", LS.nplayers, LS.max_players);
+    else snprintf(v, n, "Join, %d found", LS.nhosts);
+    return v;
+}
+static const char *lan_host_name(void) {   /* joined: the host player's name */
+    for (int i = 0; i < LS.nplayers; i++) if (LS.players[i].host) return LS.players[i].name;
+    return "";
+}
 static const char *tile_label[6] = { "Resume", "Save", "Load", "Quick settings", "Restart game", "Quit game" };
 static const char *const *tile_icon[6] = { IC_PLAY, IC_SAVE, IC_LOAD, IC_SLIDERS, IC_RESTART, IC_EXIT };
 
@@ -865,7 +956,7 @@ static void draw_bottom(void) {
     canvas *c = &CV[1];
     dots(c, 0, 0, c->w, c->h, C_BG, C_DOT);
     int gx0 = S(20), gx1 = c->w - S(20), gy0 = S(58), gy1 = S(404), bw = S(3) < 2 ? 2 : S(3);
-    int s = scr == SC_OVERWRITE ? SC_SAVE : (scr == SC_QUIT || scr == SC_RESTART || scr == SC_QUIT_NOSAVE) ? SC_MAIN : scr;
+    int s = scr == SC_OVERWRITE ? SC_SAVE : (scr == SC_QUIT || scr == SC_RESTART || scr == SC_QUIT_NOSAVE) ? SC_MAIN : (scr == SC_LAN_LEAVE || scr == SC_LAN_SWITCH) ? SC_LAN : scr;
     if (scr == SC_BUSY) {
         draw_header(c, "Please wait", "", 0);
         int w = S(420), h = S(150), x0 = (c->w - w) / 2, y0 = S(150);
@@ -876,7 +967,9 @@ static void draw_bottom(void) {
     }
     if (s == SC_MAIN) {
         char sub[120]; snprintf(sub, sizeof sub, "%s", gtitle);
-        draw_header(c, "Paused", sub, 0);
+        if (live_) snprintf(sub, sizeof sub, "%s", "The game keeps running");
+        if (off_note_until) snprintf(sub, sizeof sub, "%s", "Not during a local wireless game");
+        draw_header(c, live_ ? "Local wireless" : "Paused", sub, 0);
         int rh = S(54), gap = S(12), ty1 = gy1 - rh - S(10), tw = (gx1 - gx0 - 2 * gap) / 3, th = (ty1 - gy0 - gap) / 2;
         int nb = newest_slot();
         for (int i = 0; i < 6; i++) {
@@ -884,19 +977,21 @@ static void draw_bottom(void) {
             R_TILE[i] = (rect){ x, y, x + tw, y + th };
             uint32_t bd = sel ? (red ? C_REDL : C_LIGHT) : (red ? C_REDDIM : C_BORDER), bg = sel ? (red ? C_RED : C_BLUE) : C_PANEL;
             uint32_t fg = sel ? (red ? 0xffffff : C_ONSEL) : (red ? C_REDL : C_LIGHT), sub2 = sel ? (red ? 0xffd6dc : C_ONSELSUB) : (red ? 0xc98a92 : C_GREY);
+            if (tile_off(i)) { fg = sel ? C_ONSELSUB : C_DIM; sub2 = sel ? C_ONSELSUB : C_DIM; }
             box(c, x, y, x + tw, y + th, S(14), bw, bd, bg);
             int k = S(4) < 2 ? 2 : S(4), cy = y + (th - S(108)) / 2;   /* icon, name and hint, centred in the tile */
             bitmap(c, tile_icon[i], 12, x + (tw - 12 * k) / 2, cy, k, fg);
             mq_pick = sel; text(c, &F_MED, tile_label[i], x + tw / 2.0f, cy + S(60), S(20), fg, tw - S(16), 1); mq_pick = 0;
             char h[64] = "";
             switch (i) {
-            case 0: snprintf(h, sizeof h, "or press F / L3"); break;
+            case 0: snprintf(h, sizeof h, "or the menu button"); break;
             case 1: snprintf(h, sizeof h, "%d slots", NSLOT); break;
             case 2: if (nb >= 0) snprintf(h, sizeof h, "last: slot %d", nb + 1); else snprintf(h, sizeof h, "no saves yet"); break;
             case 3: snprintf(h, sizeof h, H.opt_count && H.opt_count(H.ctx) ? "volume, shader, effects" : "volume, brightness"); break;
             case 4: snprintf(h, sizeof h, "from the title screen"); break;
             case 5: snprintf(h, sizeof h, H.resume_on ? "keeps your spot" : "back to the menu"); break;
             }
+            if (tile_off(i)) snprintf(h, sizeof h, "not in local wireless");
             text(c, &F_REG, h, x + tw / 2.0f, cy + S(92), S(14), sub2, tw - S(16), 1);
         }
         R_MBRI = (rect){ gx0, gy1 - rh, gx1, gy1 };
@@ -927,7 +1022,7 @@ static void draw_bottom(void) {
         }
     } else if (s == SC_SET) {
         draw_header(c, "Quick settings", "changes apply at once", 1);
-        int y = gy0, rh = nrows > 6 ? S(38) : nrows > 3 ? S(48) : S(54), gap = nrows > 6 ? S(5) : nrows > 3 ? S(6) : S(10);
+        int y = gy0, rh = nrows > 8 ? S(33) : nrows > 6 ? S(38) : nrows > 3 ? S(48) : S(54), gap = nrows > 8 ? S(4) : nrows > 6 ? S(5) : nrows > 3 ? S(6) : S(10);
         for (int r = 0; r < nrows; r++) {
             int sel = r == sel_set, id = rows[r];
             R_ROW[r] = (rect){ gx0, y, gx1, y + rh }; R_BAR[r] = (rect){ 0, 0, 0, 0 };
@@ -937,20 +1032,23 @@ static void draw_bottom(void) {
                 y += rh + gap; continue;
             }
             box(c, gx0, y, gx1, y + rh, S(10), bw, sel ? C_LIGHT : C_LINE, sel ? C_BLUE : C_PANEL);
-            const char *const *ic = id == ROW_MIC ? IC_MIC : IC_SLIDERS;
+            const char *const *ic = id == ROW_MIC ? IC_MIC : id == ROW_LAN ? IC_LAN : IC_SLIDERS;
             int k = S(2) < 2 ? 2 : S(2);
             bitmap(c, ic, 12, gx0 + S(16), y + (rh - 12 * k) / 2, k, sel ? C_ONSEL : C_LIGHT);
-            const char *lab = id == ROW_MIC ? "Microphone" : id == ROW_CHEAT ? "Cheats" : H.opt_label(H.ctx, id - ROW_OPT);
-            text(c, &F_MED, lab, gx0 + S(56), y + (rh - S(20)) / 2.0f - S(1), S(20), sel ? C_ONSEL : C_LIGHT, 0, 0);
+            const char *lab = id == ROW_MIC ? "Microphone" : id == ROW_CHEAT ? "Cheats" : id == ROW_LAN ? "LAN multiplayer" : H.opt_label(H.ctx, id - ROW_OPT);
+            const int dim_row = id == ROW_LAN && LS.no_net;   /* LAN multiplayer: no Wi-Fi */
+            text(c, &F_MED, lab, gx0 + S(56), y + (rh - S(20)) / 2.0f - S(1), S(20), sel ? C_ONSEL : dim_row ? C_DIM : C_LIGHT, 0, 0);
             char v[32] = "";
             if (id == ROW_MIC) snprintf(v, sizeof v, "Test / blow");
+            else if (id == ROW_CHEAT && cheats_off()) snprintf(v, sizeof v, "not in local wireless");
             else if (id == ROW_CHEAT) {
                 int n = H.cheat_count(H.ctx), on = 0;
                 for (int i = 0; i < n; i++) on += H.cheat_get(H.ctx, i) != 0;
                 if (n) snprintf(v, sizeof v, "%d of %d on", on, n); else snprintf(v, sizeof v, "None found");
             }
+            else if (id == ROW_LAN) lan_short(v, sizeof v);
             else { snprintf(v, sizeof v, "< %s >", lang_tr(H.opt_value_name(H.ctx, id - ROW_OPT, H.opt_get(H.ctx, id - ROW_OPT)))); lang_keep(v); }
-            text(c, &F_MED, v, gx1 - S(18), y + (rh - S(20)) / 2.0f - S(1), S(20), sel ? C_ONSEL : C_CYAN, 0, 2);
+            text(c, &F_MED, v, gx1 - S(18), y + (rh - S(20)) / 2.0f - S(1), S(20), sel ? C_ONSEL : dim_row ? C_DIM : C_CYAN, 0, 2);
             y += rh + gap;
         }
         const char *help = "";
@@ -958,7 +1056,9 @@ static void draw_bottom(void) {
         case ROW_VOL: help = "Left / right to change, or tap the bar"; break;
         case ROW_BRI: help = "Left / right to change, both screens"; break;
         case ROW_MIC: help = "A live meter of the mic, and a blow for games that ask for one"; break;
-        case ROW_CHEAT: help = "Action Replay codes for this game: A to see them"; break;
+        case ROW_CHEAT: help = cheats_off() ? "Not during a local wireless game" : "Action Replay codes for this game: A to see them"; break;
+        case ROW_LAN: help = LS.no_net ? "No Wi-Fi: connect to a network in BananaOS's Settings > Network"
+                                       : "Local wireless games with consoles on this Wi-Fi network: A to open"; break;
         default: help = "Left / right to change: it applies at once, and stays for the next game"; break;
         }
         text(c, &F_REG, help, gx0 + S(4), y + S(6), S(16), C_GREY, gx1 - gx0, 0);
@@ -1013,6 +1113,164 @@ static void draw_bottom(void) {
             text(c, &F_REG, KEYS[i].what, dx, y + S(4), S(17), C_LIGHT, gx1 - dx, 0);
         }
     }
+    else if (s == SC_LAN) {
+        const int locked = lan_locked();
+        char sub[64]; lan_short(sub, sizeof sub);
+        draw_header(c, "LAN multiplayer", sub, 1);
+        lan_rows();
+        int y = gy0, rh = S(44), gap = S(6);
+        for (int r = 0; r < nlrows; r++) {
+            const int id = lrows[r], sel = r == sel_lan, leave = id == LR_LEAVE;
+            const int off = (id == LR_MODE && (locked || LS.no_net) && !lan_auto_off_only()) || (id == LR_PLAYERS && lan_players_off()) || (id == LR_HOSTS && (locked || LS.no_net));
+            R_ROW[r] = (rect){ gx0, y, gx1, y + rh };
+            uint32_t bd = sel ? (leave ? C_REDL : C_LIGHT) : (leave ? C_REDDIM : C_LINE), bg = sel ? (leave ? C_RED : C_BLUE) : C_PANEL;
+            uint32_t fg = sel ? (leave ? 0xffffff : C_ONSEL) : (leave ? C_REDL : off ? C_DIM : C_LIGHT);
+            box(c, gx0, y, gx1, y + rh, S(10), bw, bd, bg);
+            const char *lab = id == LR_MODE ? "Mode" : id == LR_PLAYERS ? "Players" : id == LR_HOSTS ? "Hosts found" : "Disconnect";
+            text(c, &F_MED, lab, gx0 + S(18), y + (rh - S(20)) / 2.0f - S(1), S(20), fg, 0, 0);
+            char v[96] = "";
+            if (id == LR_MODE) {
+                if ((locked || LS.no_net) && !lan_auto_off_only()) snprintf(v, sizeof v, "%s", lan_mode_name[LS.mode]);
+                else { snprintf(v, sizeof v, "< %s >", lang_tr(lan_mode_name[lan_pick])); lang_keep(v); }
+            } else if (id == LR_PLAYERS) {
+                if (lan_players_off()) snprintf(v, sizeof v, "%d", LS.mode == BM_LAN_HOST ? LS.max_players : LS.host_players);
+                else snprintf(v, sizeof v, "< %d >", lan_max_pick);
+            } else if (id == LR_HOSTS) {
+                if (LS.state == BM_LAN_BUSY && LS.addr[0]) snprintf(v, sizeof v, "Connecting...");
+                else snprintf(v, sizeof v, "%d found", LS.nhosts);
+            } else snprintf(v, sizeof v, lan_hosting() ? "end the session" : "leave the session");
+            text(c, &F_MED, v, gx1 - S(18), y + (rh - S(20)) / 2.0f - S(1), S(20), sel ? fg : off ? C_DIM : leave ? C_REDL : C_CYAN, 0, 2);
+            y += rh + gap;
+        }
+        /* the state: what the LAN is doing, who is in the session, what is set elsewhere */
+        y += S(4);
+        int x0 = gx0, x1 = gx1;
+        box(c, x0, y, x1, gy1, S(12), bw, LS.state == BM_LAN_FAILED ? C_REDDIM : C_BORDER, C_PANEL);
+        int ty = y + S(12), tw = x1 - x0 - S(36);
+        char l[200], l1[200], l2[200];
+        uint32_t col = C_LIGHT;
+        const char *auto_why = "";   /* Auto: a second line, what it waits for or what just happened */
+        if (LS.no_net) {   /* the mode stays; it starts again with a network */
+            snprintf(l, sizeof l, "%s", LS.msg[0] ? LS.msg : "No Wi-Fi network"); col = C_REDL;
+            auto_why = LS.mode == BM_LAN_OFF ? "Connect in BananaOS: Settings > Network."
+                                             : "Connect in BananaOS: Settings > Network. The mode stays and starts again then.";
+        }
+        else if (LS.mode == BM_LAN_AUTO) {
+            switch (LS.phase) {
+            case BM_AUTO_SEARCH: snprintf(l, sizeof l, "Auto: looking for a host of this game..."); break;
+            case BM_AUTO_JOINING: snprintf(l, sizeof l, "Auto: joining %s...", LS.addr); break;
+            case BM_AUTO_HOST:
+                snprintf(l, sizeof l, LS.nplayers > 1 ? "Auto: hosting, %d of %d players" : "Auto: hosting, waiting for players (%d of %d)",
+                         LS.nplayers, LS.max_players);
+                break;
+            case BM_AUTO_JOINED:
+                snprintf(l, sizeof l, LS.untagged ? "Auto: in %s's session (melonDS)" : "Auto: in %s's session", lan_host_name());
+                break;
+            case BM_AUTO_ONLINE: snprintf(l, sizeof l, "Auto: the game is online (Nintendo WFC)"); auto_why = "No local session while it is."; break;
+            case BM_AUTO_HELD:   /* a problem (a UDP port taken): the message, then when it tries again */
+                snprintf(l, sizeof l, "%s", LS.msg[0] ? LS.msg : "Auto: stopped"); col = C_REDL;
+                auto_why = "It tries again when the game turns its wireless off and on, or pick Off, then Auto.";
+                break;
+            default:
+                snprintf(l, sizeof l, "Auto: waiting for the game");
+                auto_why = "It starts when the game turns its wireless on (its multiplayer menu).";
+                break;
+            }
+            if (LS.msg[0] && LS.phase != BM_AUTO_HOST && LS.phase != BM_AUTO_JOINED && LS.phase != BM_AUTO_HELD) auto_why = LS.msg;
+        }
+        else if (LS.state == BM_LAN_FAILED) { snprintf(l, sizeof l, "%s", LS.msg); col = C_REDL; }
+        else if (LS.mode == BM_LAN_OFF) snprintf(l, sizeof l, "Off. Auto, Host or Join: local wireless on this Wi-Fi network.");
+        else if (LS.mode == BM_LAN_HOST && LS.state == BM_LAN_BUSY) snprintf(l, sizeof l, "Starting the session...");
+        else if (LS.mode == BM_LAN_HOST)
+            snprintf(l, sizeof l, LS.nplayers > 1 ? "Hosting: %d of %d players" : "Hosting: waiting for players (%d of %d)",
+                     LS.nplayers, LS.max_players);
+        else if (LS.state == BM_LAN_READY) snprintf(l, sizeof l, "In %s's session (%s)", lan_host_name(), LS.addr);
+        else if (LS.state == BM_LAN_BUSY && LS.addr[0]) snprintf(l, sizeof l, "Connecting to %s... (up to 5 s)", LS.addr);
+        else snprintf(l, sizeof l, "Looking for hosts on this network: %d found", LS.nhosts);
+        text(c, &F_MED, l, x0 + S(18), ty, S(18), col, tw, 0); ty += S(28);
+        if (*auto_why) {
+            const int n = wrap2(&F_REG, auto_why, S(16), tw, l1, l2, sizeof l1, 1);
+            text(c, &F_REG, l1, x0 + S(18), ty, S(16), C_BODY, tw, 0); ty += S(22);
+            if (n > 1) { text(c, &F_REG, l2, x0 + S(18), ty, S(16), C_BODY, tw, 0); ty += S(22); }
+            ty += S(2);
+        }
+        if (LS.state == BM_LAN_FAILED && LS.mode == BM_LAN_JOIN) {   /* (still looking meanwhile) */
+            snprintf(l, sizeof l, "Looking for hosts: %d found", LS.nhosts);
+            text(c, &F_REG, l, x0 + S(18), ty, S(16), C_BODY, tw, 0); ty += S(24);
+        }
+        if (LS.state == BM_LAN_READY && LS.nplayers) {   /* the players: names, the network's round trip to each */
+            char pl[400] = ""; size_t o = 0;
+            for (int i = 0; i < LS.nplayers && o < sizeof pl - 1; i++) {
+                const char *tag = LS.players[i].me ? lang_tr("you") : LS.players[i].host ? lang_tr("host") : "";
+                char one[96];
+                if (LS.players[i].ping >= 0) snprintf(one, sizeof one, "%s (%s%s%d ms)", LS.players[i].name, tag, *tag ? ", " : "", LS.players[i].ping);
+                else if (*tag) snprintf(one, sizeof one, "%s (%s)", LS.players[i].name, tag);
+                else snprintf(one, sizeof one, "%s", LS.players[i].name);
+                o += (size_t)snprintf(pl + o, sizeof pl - o, "%s%s", i ? ", " : "", one);
+            }
+            int n = wrap2(&F_REG, pl, S(16), tw, l1, l2, sizeof l1, 0);
+            text_raw(c, &F_REG, l1, x0 + S(18), ty, S(16), C_BODY, tw, 0); ty += S(22);
+            if (n > 1) { text_raw(c, &F_REG, l2, x0 + S(18), ty, S(16), C_BODY, tw, 0); ty += S(22); }
+            ty += S(4);
+        }
+        if (locked) { text(c, &F_REG, LS.mode == BM_LAN_AUTO ? "A local wireless game is on: only Off until it ends" : "A local wireless game is on: only Disconnect until it ends", x0 + S(18), ty, S(16), C_CYAN, tw, 0); ty += S(24); }
+        if (LS.env[0]) {   /* bananads.env wins over this page at each start: said, or a leftover line would win unseen */
+            snprintf(l, sizeof l, "%s is set in the environment (bananads.env): it wins at each start", LS.env);
+            int n = wrap2(&F_REG, l, S(16), tw, l1, l2, sizeof l1, 1);
+            text(c, &F_REG, l1, x0 + S(18), ty, S(16), C_REDL, tw, 0); ty += S(22);
+            if (n > 1) { text(c, &F_REG, l2, x0 + S(18), ty, S(16), C_REDL, tw, 0); ty += S(22); }
+        }
+        if (lan_pick != BM_LAN_OFF && ty + S(20) <= gy1 - S(74)) {   /* desktop melonDS's LAN warning, above the name */
+            text(c, &F_REG, "Warning: LAN requires low network latency to work.", x0 + S(18), gy1 - S(74), S(15), C_CYAN, tw, 0);
+            text(c, &F_REG, "Do not expect it to work through a VPN or any sort of tunnel.", x0 + S(18), gy1 - S(52), S(15), C_CYAN, tw, 0);
+        }
+        if (ty + S(20) <= gy1 - S(6)) {
+            snprintf(l, sizeof l, "Others see you as %s (DS name in Settings > Nintendo DS)", LS.name);
+            text(c, &F_REG, l, x0 + S(18), gy1 - S(30), S(15), C_GREY, tw, 0);
+        }
+    }
+    else if (s == SC_LAN_HOSTS) {
+        char sub[64];
+        if (LS.state == BM_LAN_BUSY && LS.addr[0]) snprintf(sub, sizeof sub, "Connecting...");
+        else snprintf(sub, sizeof sub, "%d found", LS.nhosts);
+        draw_header(c, "Hosts on this network", sub, 1);
+        const int n = LS.nhosts;
+        if (!n) {
+            const char *l[] = { "Looking for hosts...", "",
+                "On the other console: LAN multiplayer > Host.", "On a computer: melonDS, Multiplayer > Host LAN game.",
+                "Both on the same Wi-Fi network. A host shows up", "here within a second or two." };
+            for (int i = 0; i < 6; i++)
+                text(c, i ? &F_REG : &F_MED, l[i], gx0 + S(8), gy0 + S(16) + i * S(30), i ? S(17) : S(21), i ? C_BODY : C_LIGHT, gx1 - gx0 - S(16), 0);
+        } else {
+            int rh = S(44), gap = S(6), vis = 6;
+            if (sel_host >= n) sel_host = n - 1;
+            if (sel_host < top_host) top_host = sel_host;
+            if (sel_host >= top_host + vis) top_host = sel_host - vis + 1;
+            if (top_host > (n > vis ? n - vis : 0)) top_host = n > vis ? n - vis : 0;
+            int y = gy0;
+            for (int r = 0; r < vis; r++) {
+                int i = top_host + r;
+                R_ROW[r] = (rect){ 0, 0, 0, 0 };
+                if (i >= n) break;
+                int sel = i == sel_host;
+                R_ROW[r] = (rect){ gx0, y, gx1, y + rh };
+                box(c, gx0, y, gx1, y + rh, S(10), bw, sel ? C_LIGHT : C_LINE, sel ? C_BLUE : C_PANEL);
+                char v[96]; snprintf(v, sizeof v, "%d/%d  %s", LS.hosts[i].players, LS.hosts[i].max, LS.hosts[i].addr);
+                float vw = text_w_raw(&F_REG, v, S(16), 99);
+                text_raw(c, &F_REG, v, gx1 - S(14), y + (rh - S(16)) / 2.0f - S(1), S(16), sel ? C_ONSEL : C_CYAN, 0, 2);
+                text_raw(c, &F_MED, LS.hosts[i].name, gx0 + S(16), y + (rh - S(19)) / 2.0f - S(1), S(19),
+                         sel ? C_ONSEL : C_LIGHT, gx1 - gx0 - vw - S(44), 0);
+                y += rh + gap;
+            }
+            if (n > vis) {   /* where in the list */
+                int ty0 = gy0, ty1 = gy0 + vis * (rh + gap) - gap, th = (ty1 - ty0) * vis / n; if (th < S(12)) th = S(12);
+                int t0 = ty0 + (int)((long long)(ty1 - ty0 - th) * top_host / (n - vis));
+                fill(c, gx1 + S(6), t0, gx1 + S(10), t0 + th, C_GREY, 1.0f);
+            }
+            text(c, &F_REG, LS.state == BM_LAN_BUSY && LS.addr[0] ? "Connecting: it can take up to 5 s" : "A to join; players / the most, and the host's address",
+                 gx0 + S(4), y + S(4), S(15), C_GREY, gx1 - gx0, 0);
+        }
+    }
     else if (s == SC_MIC) {
         draw_header(c, "Microphone", "", 1);
         float lv = 0, fl = 0, th = 0; int st = H.mic_meter ? H.mic_meter(H.ctx, &lv, &fl, &th) : -1;
@@ -1061,11 +1319,22 @@ static void draw_bottom(void) {
     int fy = c->h - S(56);
     const char *bl = s == SC_MAIN ? "Resume" : "Back", *al = "Select", *mid = "";
     if (s == SC_SAVE) al = "Save"; else if (s == SC_LOAD) al = "Load";
-    else if (s == SC_SET) al = rows[sel_set] == ROW_MIC || rows[sel_set] == ROW_CHEAT ? "Open" : "OK";
+    else if (s == SC_SET) al = rows[sel_set] == ROW_MIC || (rows[sel_set] == ROW_LAN && !LS.no_net) || (rows[sel_set] == ROW_CHEAT && !cheats_off()) ? "Open" : "OK";
+    else if (s == SC_LAN) {
+        const int id = nlrows ? lrows[sel_lan] : LR_MODE;
+        if (id == LR_MODE && lan_auto_off_only()) al = lan_pick == BM_LAN_OFF ? "Turn off" : "OK";
+        else if (id == LR_MODE) al = lan_locked() || LS.no_net ? "OK" : lan_pick != LS.mode ? (lan_pick == BM_LAN_HOST ? "Start hosting" : lan_pick == BM_LAN_JOIN ? "Look for hosts" : lan_pick == BM_LAN_AUTO ? "Turn on Auto" : "Turn off")
+                              : LS.mode == BM_LAN_JOIN && LS.state != BM_LAN_READY ? "Hosts" : "OK";
+        else if (id == LR_PLAYERS) al = !lan_players_off() && LS.mode == BM_LAN_HOST && lan_max_pick != LS.max_players ? "Apply" : "OK";
+        else if (id == LR_HOSTS) al = "Open";
+        else al = "Disconnect";
+    }
+    else if (s == SC_LAN_HOSTS) al = LS.nhosts && !(LS.state == BM_LAN_BUSY && LS.addr[0]) ? "Join" : "OK";
     else if (s == SC_CHEAT) al = H.cheat_count(H.ctx) ? (H.cheat_get(H.ctx, sel_cheat) ? "Turn off" : "Turn on") : "Back";
     else if (s == SC_MIC) al = "Blow for 3 s";
     else if (s == SC_KEYS) al = "OK";
     if (s == SC_MAIN) mid = "D-pad or tap";
+    if (s == SC_LAN && nlrows && lrows[sel_lan] == LR_PLAYERS && LS.mode != BM_LAN_HOST) mid = "Turn Host on to change it";
     /* the translator, where the menu's language shows (the file's translated-by: "简体中文 · Majirefy") */
     char credit[160];
     if (s == SC_SET && lang_active() && *lang_by()) {
@@ -1096,6 +1365,19 @@ static void draw_bottom(void) {
     else if (scr == SC_RESTART)
         dialog(c, "Restart the game?", "Back to the title screen. Anything since your last save will be lost.",
                "Keep playing", "Restart", 1);
+    else if (scr == SC_LAN_SWITCH) {
+        char t[96], b[160];
+        const int h = lan_hosting();
+        snprintf(t, sizeof t, "Disconnect from %s?", lang_tr(lan_mode_name[LS.mode]));
+        if (lan_pick == BM_LAN_OFF) snprintf(b, sizeof b, "%s", h ? "It turns off; the session ends for the other players." : "It turns off; you leave the host's session.");
+        else snprintf(b, sizeof b, h ? "It switches to %s; the session ends for the other players." : "It switches to %s; you leave the host's session.",
+                      lang_tr(lan_mode_name[lan_pick]));
+        dialog(c, t, b, "No", "Yes", 1);
+    }
+    else if (scr == SC_LAN_LEAVE)
+        dialog(c, lan_hosting() ? "End the session?" : "Leave the session?",
+               "A local wireless game is on: it stops for the other players too (their game shows its own error).",
+               "Keep playing", LS.mode == BM_LAN_AUTO ? "Turn off" : "Disconnect", 1);
 }
 
 static void show(int i) {
@@ -1138,10 +1420,89 @@ static void do_load(int n) {
     if (!ok) mlog("[menu] %s couldn't be loaded\n", n < 0 ? "the undo slot" : "the slot");
     play(SND_SELECT); close_menu();
 }
+/* LAN multiplayer's actions */
+static void lan_leave(void) {   /* Disconnect: a host's session ends (Off); a joined player goes back to looking.
+                                  * Auto (Off, in a local wireless game): off, the session ends or is left */
+    if (LS.mode == BM_LAN_AUTO) {
+        mlog("[menu] LAN: off (in a local wireless game)\n");
+        H.lan_set(H.ctx, BM_LAN_OFF, 0, ""); lan_pick = BM_LAN_OFF;
+        lan_poll(); scr = SC_LAN; sel_lan = 0; play(SND_SELECT); dirty_top = dirty_bot = 1;
+        return;
+    }
+    mlog("[menu] LAN: disconnect (%s)\n", LS.mode == BM_LAN_HOST ? "the session ends" : "back to looking for hosts");
+    if (LS.mode == BM_LAN_HOST) { H.lan_set(H.ctx, BM_LAN_OFF, 0, ""); lan_pick = BM_LAN_OFF; }
+    else H.lan_set(H.ctx, BM_LAN_JOIN, 0, "");
+    lan_poll(); scr = SC_LAN; sel_lan = 0; play(SND_SELECT); dirty_top = dirty_bot = 1;
+}
+static void lan_activate(void) {
+    lan_rows();
+    const int id = lrows[sel_lan], locked = lan_locked();
+    if (id == LR_LEAVE) {
+        if (locked) { scr = SC_LAN_LEAVE; play(SND_SELECT); dirty_bot = 1; }
+        else lan_leave();
+        return;
+    }
+    if (id == LR_MODE && lan_auto_off_only()) {   /* Off in a game: asked first */
+        if (lan_pick == BM_LAN_OFF) { scr = SC_LAN_LEAVE; play(SND_SELECT); dirty_bot = 1; }
+        else play(SND_SELECT);
+        return;
+    }
+    if (locked) { play(SND_BACK); mlog("[menu] LAN: no mode change in a local wireless game\n"); return; }
+    if (LS.no_net) { play(SND_BACK); mlog("[menu] LAN: no Wi-Fi\n"); return; }
+    if (id == LR_MODE && lan_pick != LS.mode && lan_with_others() && scr != SC_LAN_SWITCH) {   /* asked first */
+        scr = SC_LAN_SWITCH; play(SND_SELECT); dirty_bot = 1; return;
+    }
+    if (id == LR_MODE && lan_pick != LS.mode) {
+        scr = SC_LAN;
+        mlog("[menu] LAN: %s\n", lan_pick == BM_LAN_HOST ? "host" : lan_pick == BM_LAN_JOIN ? "look for hosts"
+                                 : lan_pick == BM_LAN_AUTO ? "auto" : "off");
+        H.lan_set(H.ctx, lan_pick, lan_pick == BM_LAN_HOST ? lan_max_pick : 0, "");   /* (Auto: Host's size) */
+        lan_poll(); play(SND_SELECT); dirty_bot = 1;
+        if (lan_pick == BM_LAN_JOIN) { scr = SC_LAN_HOSTS; sel_host = top_host = 0; lan_joining = 0; }
+        return;
+    }
+    if ((id == LR_MODE && LS.mode == BM_LAN_JOIN && LS.state != BM_LAN_READY) || id == LR_HOSTS) {
+        scr = SC_LAN_HOSTS; sel_host = top_host = 0; lan_joining = 0; play(SND_SELECT); dirty_bot = 1; return;
+    }
+    if (id == LR_PLAYERS && !lan_players_off() && LS.mode == BM_LAN_HOST && lan_max_pick != LS.max_players) {
+        mlog("[menu] LAN: host again, %d players at most\n", lan_max_pick);
+        H.lan_set(H.ctx, BM_LAN_HOST, lan_max_pick, ""); lan_poll(); play(SND_SELECT); dirty_bot = 1; return;
+    }
+    play(SND_SELECT);
+}
+static void lan_adjust(int d) {   /* left/right on the LAN page */
+    lan_rows();
+    const int id = lrows[sel_lan];
+    if (id == LR_MODE && lan_auto_off_only()) {   /* Auto or Off */
+        lan_pick = lan_pick == BM_LAN_OFF ? BM_LAN_AUTO : BM_LAN_OFF; play(SND_MOVE); dirty_bot = 1;
+    }
+    else if (id == LR_MODE && !lan_locked() && !LS.no_net) {
+        int k = 0;
+        while (k < BM_LAN_MODES - 1 && lan_cycle[k] != lan_pick) k++;
+        lan_pick = lan_cycle[(k + d + BM_LAN_MODES) % BM_LAN_MODES]; play(SND_MOVE); dirty_bot = 1;
+    }
+    else if (id == LR_PLAYERS && !lan_players_off()) {
+        int v = lan_max_pick + d; v = v < 2 ? 2 : v > BM_LAN_MAX ? BM_LAN_MAX : v;
+        if (v != lan_max_pick) { lan_max_pick = v; play(SND_MOVE); dirty_bot = 1; }
+    }
+}
+static void lan_join(int i) {
+    if (i < 0 || i >= LS.nhosts || (LS.state == BM_LAN_BUSY && LS.addr[0])) { play(SND_BACK); return; }
+    if (lan_locked() || LS.no_net) { play(SND_BACK); return; }
+    char addr[48]; snprintf(addr, sizeof addr, "%s", LS.hosts[i].addr);
+    mlog("[menu] LAN: join %s\n", addr);
+    H.lan_set(H.ctx, BM_LAN_JOIN, 0, addr);
+    lan_joining = 1; lan_poll(); play(SND_SELECT); dirty_bot = 1;
+}
 static void back(void);
 static void activate(void) {
     switch (scr) {
     case SC_MAIN:
+        if (tile_off(sel_main)) {   /* off in a local wireless game: the reason, no action */
+            play(SND_BACK); off_note_until = now_ms() + 2500; dirty_bot = 1;
+            mlog("[menu] %s is off in a local wireless game\n", tile_label[sel_main]);
+            break;
+        }
         switch (sel_main) {
         case 0: play(SND_BACK); close_menu(); break;
         case 1: case 2: {
@@ -1163,13 +1524,20 @@ static void activate(void) {
     case SC_LOAD: if (SL[sel_slot].used) do_load(sel_slot); else play(SND_BACK); break;
     case SC_SET:
         if (rows[sel_set] == ROW_MIC) { scr = SC_MIC; play(SND_SELECT); dirty_bot = 1; }
+        else if (rows[sel_set] == ROW_CHEAT && cheats_off()) { play(SND_BACK); mlog("[menu] Cheats are off in a local wireless game\n"); }
         else if (rows[sel_set] == ROW_CHEAT) { scr = SC_CHEAT; sel_cheat = top_cheat = 0; play(SND_SELECT); dirty_bot = 1; }
+        else if (rows[sel_set] == ROW_LAN && (lan_poll(), LS.no_net)) { play(SND_BACK); mlog("[menu] LAN multiplayer: no Wi-Fi\n"); }
+        else if (rows[sel_set] == ROW_LAN) { lan_open(); scr = SC_LAN; play(SND_SELECT); dirty_bot = 1; }
         else play(SND_SELECT);
         break;
     case SC_CHEAT:
-        if (!H.cheat_count(H.ctx)) { back(); break; }
+        if (!H.cheat_count(H.ctx) || cheats_off()) { back(); break; }
         H.cheat_set(H.ctx, sel_cheat, !H.cheat_get(H.ctx, sel_cheat)); play(SND_SELECT); dirty_bot = 1;
         break;
+    case SC_LAN: lan_activate(); break;
+    case SC_LAN_HOSTS: lan_join(sel_host); break;
+    case SC_LAN_LEAVE: lan_leave(); break;
+    case SC_LAN_SWITCH: lan_activate(); break;   /* Yes: the mode picked */
     case SC_MIC:
         /* the game has to run to hear it: back to the game, with a pop-up for as long as it blows */
         play(SND_SELECT); if (H.blow) H.blow(H.ctx, 3000); close_menu();
@@ -1200,7 +1568,9 @@ static void back(void) {
     case SC_OVERWRITE: scr = SC_SAVE; dirty_bot = 1; break;
     case SC_QUIT: case SC_RESTART: scr = SC_MAIN; dirty_bot = 1; break;
     case SC_QUIT_NOSAVE: scr = SC_QUIT; dirty_bot = 1; break;
-    case SC_MIC: case SC_CHEAT: scr = SC_SET; dirty_bot = 1; break;
+    case SC_MIC: case SC_CHEAT: case SC_LAN: scr = SC_SET; dirty_bot = 1; break;
+    case SC_LAN_HOSTS: case SC_LAN_LEAVE: scr = SC_LAN; dirty_bot = 1; break;
+    case SC_LAN_SWITCH: lan_pick = LS.mode; scr = SC_LAN; dirty_bot = 1; break;   /* No: the mode stays */
     default: scr = SC_MAIN; dirty_top = dirty_bot = 1; break;
     }
 }
@@ -1235,6 +1605,15 @@ static void nav(int dx, int dy) {
     } else if (scr == SC_SET) {
         if (dy) { int n = sel_set + dy; if (n >= 0 && n < nrows) { sel_set = n; moved = 1; } }
         if (dx) { adjust(dx); return; }
+    } else if (scr == SC_LAN) {
+        lan_rows();
+        if (dy) { int n = sel_lan + dy; if (n >= 0 && n < nlrows) { sel_lan = n; moved = 1; } }
+        if (dx) { lan_adjust(dx); return; }
+    } else if (scr == SC_LAN_HOSTS) {
+        int n = LS.nhosts, m = sel_host + dy + dx * 6;
+        if (m > n - 1) m = n - 1;
+        if (m < 0) m = 0;
+        if (n && m != sel_host) { sel_host = m; moved = 1; }
     } else if (scr == SC_CHEAT) {
         int n = H.cheat_count(H.ctx), m = sel_cheat + dy + dx * CHEAT_ROWS;
         if (m < 0) m = 0; if (m > n - 1) m = n - 1;
@@ -1243,7 +1622,7 @@ static void nav(int dx, int dy) {
     if (moved) { play(SND_MOVE); dirty_bot = 1; }
 }
 static void tap(int px, int py) {               /* a touch-down on the bottom panel, in panel pixels */
-    if (scr == SC_OVERWRITE || scr == SC_QUIT || scr == SC_RESTART || scr == SC_QUIT_NOSAVE) {
+    if (scr == SC_OVERWRITE || scr == SC_QUIT || scr == SC_RESTART || scr == SC_QUIT_NOSAVE || scr == SC_LAN_LEAVE || scr == SC_LAN_SWITCH) {
         if (in_rect(R_DLG_A, px, py)) activate(); else if (in_rect(R_DLG_B, px, py)) back();
         else if (scr == SC_QUIT && in_rect(R_DLG_X, px, py)) quit_nosave_ask();
         return;
@@ -1276,13 +1655,23 @@ static void tap(int px, int py) {               /* a touch-down on the bottom pa
                 if (id == ROW_VOL) { vol = v; want(vol, -1); } else bri_set(v);
                 play(SND_MOVE); dirty_bot = 1;
             } else if (id == ROW_MIC) activate();
-            else if (id == ROW_CHEAT) activate();
+            else if (id == ROW_CHEAT || id == ROW_LAN) activate();
             else if (id >= ROW_OPT) { sel_set = r; adjust(1); }
             else play(SND_MOVE);
             return;
         }
     } else if (scr == SC_CHEAT) {
         for (int r = 0; r < CHEAT_ROWS; r++) if (in_rect(R_ROW[r], px, py)) { sel_cheat = top_cheat + r; activate(); return; }
+    } else if (scr == SC_LAN) {   /* a row: picked; a second tap acts (Mode and Players: the next value) */
+        lan_rows();
+        for (int r = 0; r < nlrows; r++) if (in_rect(R_ROW[r], px, py)) {
+            if (sel_lan != r) { sel_lan = r; play(SND_MOVE); dirty_bot = 1; }
+            else if (lrows[r] == LR_MODE || lrows[r] == LR_PLAYERS) lan_adjust(1);
+            else activate();
+            return;
+        }
+    } else if (scr == SC_LAN_HOSTS) {
+        for (int r = 0; r < 6; r++) if (in_rect(R_ROW[r], px, py)) { sel_host = top_host + r; dirty_bot = 1; activate(); return; }
     }
 }
 
@@ -1306,6 +1695,7 @@ static void handle(const bmenu_ev *e) {
     else if (b == BM_L && scr == SC_SET) adjust(-1); else if (b == BM_R && scr == SC_SET) adjust(1);
     else if (b == BM_L && scr == SC_MAIN) adjust_main_bri(-1); else if (b == BM_R && scr == SC_MAIN) adjust_main_bri(1);
     else if (b == BM_L && scr == SC_CHEAT) nav(-1, 0); else if (b == BM_R && scr == SC_CHEAT) nav(1, 0);
+    else if (b == BM_L && (scr == SC_LAN || scr == SC_LAN_HOSTS)) nav(-1, 0); else if (b == BM_R && (scr == SC_LAN || scr == SC_LAN_HOSTS)) nav(1, 0);
 }
 
 void bmenu_init(const bmenu_host *h) { H = *h; }
@@ -1319,6 +1709,11 @@ int bmenu_run(int start) {
     open_ = 1; scr = SC_MAIN; sel_main = 0; held_dir = 0;
     bri_changed = 0; make_rows(); main_col = 0;
     bri = brightness_get();         /* the main page's Brightness row */
+    mp_locked = H.mp_lock && H.mp_lock(H.ctx); off_note_until = 0;
+    live_ = H.live && H.live(H.ctx);
+    if (live_) mp_locked = 1;
+    if (live_) mlog("[menu] a local wireless game: the game keeps running; Save, Load, Restart game and Cheats are off\n");
+    else if (mp_locked) mlog("[menu] a local wireless game: Save, Load, Restart game and Cheats are off\n");
     scan_slots(0);
     load_recent();
     grab_background();
@@ -1332,6 +1727,13 @@ int bmenu_run(int start) {
         while (open_ && H.poll(H.ctx, &e)) handle(&e);
         if (open_ && held_dir && now_ms() >= rep_next) { nav(rep_dx, rep_dy); rep_next = now_ms() + 110; }
         { static long long mt; if (scr == SC_MIC && now_ms() - mt >= 33) { mt = now_ms(); dirty_bot = 1; } }   /* the meter moves */
+        if ((scr == SC_LAN || scr == SC_LAN_HOSTS || scr == SC_LAN_LEAVE || scr == SC_LAN_SWITCH || scr == SC_SET) && now_ms() - lan_polled >= 500) {
+            if (lan_poll()) dirty_bot = 1;   /* the LAN's state, twice a second; a join done: back to the page */
+            if (scr == SC_LAN_HOSTS && lan_joining && !(LS.state == BM_LAN_BUSY && LS.addr[0])) { lan_joining = 0; scr = SC_LAN; sel_lan = 0; dirty_bot = 1; }
+            if (scr == SC_LAN_LEAVE && LS.state != BM_LAN_READY) { scr = SC_LAN; dirty_bot = 1; }
+            if (scr == SC_LAN_SWITCH && (!lan_with_others() || lan_locked())) { scr = SC_LAN; dirty_bot = 1; }   /* nobody left: no question */
+            if (scr == SC_LAN_HOSTS && LS.no_net) { lan_joining = 0; scr = SC_LAN; sel_lan = 0; dirty_bot = 1; }   /* the network went */
+        }
         { static long long vt; if (scr == SC_SET && now_ms() - vt >= 500) { vt = now_ms(); want_ex(-1, -1, 1); }   /* the volume keys' */
           int r = vol_read; if (r >= 0) { vol_read = -1; if (scr == SC_SET && r != vol && now_ms() - vol_set_at > 1500) { vol = r; dirty_bot = 1; } } }
         /* the brightness, as bananad's F + volume may have moved it (a step of its own: 3 or more off) */
@@ -1340,6 +1742,14 @@ int bmenu_run(int start) {
             for (int i = 0; i < 2; i++) { int v = bl_pm(i); if (v > 0) { sum += v; n++; } }
             int b = n ? (sum / n + 5) / 10 : bri;
             if (b - bri >= 3 || bri - b >= 3) { bri = brightness_get(); dirty_bot = 1; } } }
+        if (off_note_until && now_ms() >= off_note_until) { off_note_until = 0; dirty_bot = 1; }
+        { static long long lt; if (live_ && now_ms() - lt >= 250) { lt = now_ms();   /* the local game over: paused now */
+            if (!H.live(H.ctx)) {
+                live_ = 0; mp_locked = H.mp_lock && H.mp_lock(H.ctx); off_note_until = 0;
+                mlog(mp_locked ? "[menu] the game is paused now; Save, Load, Restart game and Cheats stay off\n"
+                               : "[menu] the local wireless game is over: the game is paused, Save, Load, Restart game and Cheats are on again\n");
+                dirty_top = dirty_bot = 1;
+            } } }
         if (now_ms() - clock_t0 >= 15000) { clock_t0 = now_ms(); if (scr == SC_MAIN || scr == SC_SET || scr == SC_QUIT || scr == SC_QUIT_NOSAVE) dirty_top = 1; }   /* the clock */
         /* RetroAchievements finishes its login and the game's lookup 10-15 s after a start: a menu opened before that
          * had no achievements on its top screen until it was opened again. Looked at twice a second while open. */

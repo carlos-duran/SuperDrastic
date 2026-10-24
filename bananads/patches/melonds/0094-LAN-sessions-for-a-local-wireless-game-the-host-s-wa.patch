@@ -1,0 +1,767 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carlos Duran <15650777+carlos-duran@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 12:00:00 +0000
+Subject: [PATCH] LAN: sessions for a local wireless game (the host's waits,
+ late joiners, one session after another, a game tag, leaving)
+
+What a frontend needs to run melonDS's LAN through a whole local wireless game, and to start, change and end
+sessions while the game runs (BananaDS's in-game LAN page and its automatic mode). Every message on the wire is
+melonDS's own, so a peer without this patch (desktop melonDS 1.0/1.1) plays along.
+
+- The host waited MPRecvTimeout for a reply from every player connected to the LAN session, so a player connected
+  but not in the game's DS group (its menu open, between races) stalled every MP frame (~38 fps for ~16 s). It now
+  waits only for the players in its group: a player counts once it sends an auth/association request or an MP
+  reply, and stops counting after 20 missed replies in a row, when its wifi powers off or when it leaves. Non-MP
+  frames that arrive while it waits are requeued instead of dropped. (MyMAC: our own DS MAC, learned from our
+  beacons and MP commands, so that only requests addressed to us count.)
+- A player learns that another's DS wifi is on only from the Cmd_PlayerConnect sent when it turns on, so one that
+  joined the session later took the host for gone at its first MP command. Whoever has its wifi on now sends its
+  Cmd_PlayerConnect to each player that joins (a host to a new client, a client to the host and to another
+  client's direct link).
+- Accessors for the frontend: Wifi::InMPMode(), Wifi::IsPoweredOn(), LAN::GetMPActiveBitmask() and
+  GetOtherPlayersBitmask().
+- One session after another in the same run: EndSession clears the old session's players, connected and
+  MP-active bits, miss counts and last host. The discovery socket gets SO_REUSEADDR, so discovery can run beside
+  a host or restart right after a session ends.
+- A game tag in the discovery beacon, its layout and size unchanged: SetDiscoveryTag() puts "BDS", a version, the
+  game code, flags and a random nonce after the NUL that ends SessionName (offset 40; the visible name is cut to
+  39 characters then), which melonDS without this patch never reads; ReadDiscoveryTag() reads it back.
+  SetDiscoveryStatus() fills the beacon's Status (0 idle, 1 playing), which melonDS's LAN dialog already shows.
+  SetHostListens(true) lets a host hear the other hosts' beacons (off by default).
+- Leaving: EndSession queued an ENet disconnect for each peer and destroyed the host at once, so the others
+  dropped us only when ENet timed out, seconds later. It now flushes the disconnects and services the host until
+  they are acknowledged, 300 ms at most.
+- "[diag]" traces of the LAN traffic, the connected bits and a per-second summary (Debug level, rate-limited).
+---
+ src/Wifi.h      |   4 +
+ src/net/LAN.cpp | 382 ++++++++++++++++++++++++++++++++++++++++++++++--
+ src/net/LAN.h   |  38 +++++
+ 3 files changed, 413 insertions(+), 11 deletions(-)
+
+diff --git a/src/Wifi.h b/src/Wifi.h
+index 61d7535..36595f4 100644
+--- a/src/Wifi.h
++++ b/src/Wifi.h
+@@ -172,6 +172,10 @@ public:
+ 
+     const u8* GetMAC() const;
+     const u8* GetBSSID() const;
++    // BananaDS: the game's Wi-Fi is in a local multiplayer mode (host beaconing or client synced)
++    bool InMPMode() const { return IsMP; }
++    // BananaDS: the game's Wi-Fi is powered on (Platform::MP_Begin was called and MP_End not since)
++    bool IsPoweredOn() const { return PowerOn; }
+ 
+ private:
+     melonDS::NDS& NDS;
+diff --git a/src/net/LAN.cpp b/src/net/LAN.cpp
+index 0f43803..3b3db01 100644
+--- a/src/net/LAN.cpp
++++ b/src/net/LAN.cpp
+@@ -43,6 +43,7 @@
+ #endif
+ 
+ #include "LAN.h"
++#include <random>
+ 
+ 
+ namespace melonDS
+@@ -56,6 +57,72 @@ const u32 kProtocolVersion = 1;
+ 
+ const u32 kLocalhost = 0x0100007F;
+ 
++// RecvReplies: a MP-active player that doesn't reply to this many MP commands in a row (each one a full
++// MPRecvTimeout wait) is no longer waited for, until it sends us a reply or an auth/association request again
++const int kMPMaxMisses = 20;
++
++// BananaDS diagnostics: Debug level (BananaDS log.level 0), "[diag] LAN" prefix, rate-limited
++namespace landiag
++{
++struct Rate { u64 Start; int N; int Held; };
++static Rate RSend, RRecv, RGone;
++static int LastSender = -1;
++static u16 LastBitmask = 0xFFFF;
++// per-second counters, reported from Process()
++static u64 CountStart = 0;
++static int NSendPkt, NSendCmd, NSendReply, NSendAck, NRecvPkt, NRecvHost, NHostTimeout;
++
++static bool Allow(Rate& r, int max, const char* cat)
++{
++    u64 now = Platform::GetMSCount();
++    if (r.Start == 0 || (now - r.Start) >= 1000)
++    {
++        if (r.Held)
++            Platform::Log(Platform::LogLevel::Debug, "[diag] LAN (%s: %d more lines not shown in the last second)\n", cat, r.Held);
++        r.Start = now; r.N = 0; r.Held = 0;
++    }
++    if (r.N < max) { r.N++; return true; }
++    r.Held++;
++    return false;
++}
++
++static bool MacIs(const u8* m, u8 last)
++{
++    return m[0] == 0x03 && m[1] == 0x09 && m[2] == 0xBF && m[3] == 0 && m[4] == 0 && m[5] == last;
++}
++
++// pkt: melonDS's 12-byte TX/RX header, then the 802.11 header; nullptr for beacons (not logged)
++static const char* Kind(const u8* pkt, int len)
++{
++    if (len < 12 + 24) return "short";
++    const u8* h = &pkt[12];
++    if (MacIs(&h[4], 0x00)) return "MP-CMD";
++    if (MacIs(&h[16], 0x10) || MacIs(&h[4], 0x10)) return "MP-REPLY";
++    if (MacIs(&h[4], 0x03)) return "MP-ACK";
++    u16 fc = h[0] | (h[1] << 8);
++    u16 type = (fc >> 2) & 3, sub = (fc >> 4) & 0xF;
++    static const char* mgmt[16] = {"assoc-req", "assoc-resp", "reassoc-req", "reassoc-resp", "probe-req",
++        "probe-resp", "mgmt-6", "mgmt-7", nullptr, "ATIM", "disassoc", "auth", "deauth", "action", "mgmt-14", "mgmt-15"};
++    if (type == 0) return mgmt[sub];
++    if (type == 1) return "ctrl";
++    if (type == 2) return "data";
++    return "type-3";
++}
++
++static void Packet(const char* dir, Rate& r, const u8* pkt, int len, int ret, u64 ts, int me, u16 connected, int sender)
++{
++    if (!pkt || len < 12 + 24) return;
++    const char* kind = Kind(pkt, len);
++    if (!kind) return; // beacon
++    if (!Allow(r, 30, dir)) return;
++    const u8* h = &pkt[12];
++    Platform::Log(Platform::LogLevel::Debug,
++        "[diag] LAN %s %s fc=%02X%02X dst=%02X:%02X:%02X:%02X:%02X:%02X src=%02X:%02X:%02X:%02X:%02X:%02X ch=%d len=%d ret=%d ts=%llu me=%d sender=%d connected=%04X\n",
++        dir, kind, h[1], h[0], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15],
++        pkt[9], len, ret, (unsigned long long)ts, me, sender, connected);
++}
++}
++
+ enum
+ {
+     Chan_Cmd = 0,           // channel 0 -- control commands
+@@ -82,6 +149,11 @@ LAN::LAN() noexcept : Inited(false)
+ 
+     DiscoverySocket = INVALID_SOCKET;
+     DiscoveryLastTick = 0;
++    {
++        std::random_device rd;
++        DiscoveryNonce = rd() ^ ((u32)Platform::GetUSCount() * 2654435761u);
++        if (!DiscoveryNonce) DiscoveryNonce = 1;
++    }
+ 
+     Active = false;
+     IsHost = false;
+@@ -94,6 +166,10 @@ LAN::LAN() noexcept : Inited(false)
+     MaxPlayers = 0;
+ 
+     ConnectedBitmask = 0;
++    MPActiveBitmask = 0;
++    memset(MPMissCount, 0, sizeof(MPMissCount));
++    memset(MyMAC, 0, sizeof(MyMAC));
++    MyMACKnown = false;
+ 
+     MPRecvTimeout = 25;
+     LastHostID = -1;
+@@ -178,6 +254,11 @@ bool LAN::StartDiscovery()
+         return false;
+     }
+ 
++    // BananaDS: more than one listener on the discovery port (a host and a player looking for hosts on the same
++    // machine, as in the tests): each gets the broadcasts
++    int opt_reuse = 1;
++    setsockopt(DiscoverySocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt_reuse, sizeof(int));
++
+     sockaddr_in_t saddr;
+     memset(&saddr, 0, sizeof(saddr));
+     saddr.sin_family = AF_INET;
+@@ -203,6 +284,9 @@ bool LAN::StartDiscovery()
+     DiscoveryLastTick = (u32)Platform::GetMSCount();
+     DiscoveryList.clear();
+ 
++    MPActiveBitmask = 0;
++    memset(MPMissCount, 0, sizeof(MPMissCount));
++    MyMACKnown = false;
+     Active = true;
+     return true;
+ }
+@@ -254,6 +338,9 @@ bool LAN::StartHost(const char* playername, int numplayers)
+     LastHostID = -1;
+     LastHostPeer = nullptr;
+ 
++    MPActiveBitmask = 0;
++    memset(MPMissCount, 0, sizeof(MPMissCount));
++    MyMACKnown = false;
+     Active = true;
+     IsHost = true;
+ 
+@@ -365,7 +452,11 @@ bool LAN::StartClient(const char* playername, const char* host)
+     LastHostPeer = nullptr;
+     RemotePeers[0] = peer;
+     peer->data = &Players[0];
++    SendWifiStateTo(peer, 0, "the host");
+ 
++    MPActiveBitmask = 0;
++    memset(MPMissCount, 0, sizeof(MPMissCount));
++    MyMACKnown = false;
+     Active = true;
+     IsHost = false;
+     return true;
+@@ -395,9 +486,57 @@ void LAN::EndSession()
+         RemotePeers[i] = nullptr;
+     }
+ 
++    // enet_peer_disconnect only queues the disconnect: destroyed at once, the host never sent it, and the others
++    // dropped us only when ENet timed us out (seconds later; a player who came back meanwhile was listed twice).
++    // Send it and wait for the acknowledgements, 300 ms at most so that a lost network or a quit doesn't hang.
++    // (No Host: only looking for hosts, or a client whose connection failed.)
++    if (Host)
++    {
++        int asked = 0;
++        for (size_t i = 0; i < Host->peerCount; i++)
++        {
++            ENetPeer* peer = &Host->peers[i];
++            if (peer->state == ENET_PEER_STATE_DISCONNECTED || peer->state == ENET_PEER_STATE_ZOMBIE) continue;
++            if (peer->state != ENET_PEER_STATE_DISCONNECTING && peer->state != ENET_PEER_STATE_ACKNOWLEDGING_DISCONNECT)
++                enet_peer_disconnect(peer, 0);
++            asked++;
++        }
++        const u64 t0 = Platform::GetMSCount();
++        int left = asked;
++        enet_host_flush(Host);
++        while (left > 0 && Platform::GetMSCount() - t0 < 300)
++        {
++            ENetEvent event;
++            if (enet_host_service(Host, &event, 10) > 0 && event.type == ENET_EVENT_TYPE_RECEIVE)
++                enet_packet_destroy(event.packet);
++            left = 0;
++            for (size_t i = 0; i < Host->peerCount; i++)
++            {
++                const ENetPeerState st = Host->peers[i].state;
++                if (st != ENET_PEER_STATE_DISCONNECTED && st != ENET_PEER_STATE_ZOMBIE) left++;
++            }
++        }
++        if (asked)
++            Platform::Log(Platform::LogLevel::Debug, "[diag] LAN EndSession: told %d peer%s we leave, %d acknowledged in %llu ms\n",
++                asked, asked == 1 ? "" : "s", asked - left, (unsigned long long)(Platform::GetMSCount() - t0));
++    }
++
+     enet_host_destroy(Host);
+     Host = nullptr;
+     IsHost = false;
++
++    // BananaDS: nothing of this session carries over into the next one (the frontend can end a session and start
++    // another in the same run): its players, who was connected, who was in a DS group with us
++    Platform::Mutex_Lock(PlayersMutex);
++    memset(Players, 0, sizeof(Players));
++    NumPlayers = 0;
++    MaxPlayers = 0;
++    Platform::Mutex_Unlock(PlayersMutex);
++    ConnectedBitmask = 0;
++    MPActiveBitmask = 0;
++    memset(MPMissCount, 0, sizeof(MPMissCount));
++    LastHostID = -1;
++    LastHostPeer = nullptr;
+ }
+ 
+ 
+@@ -424,7 +563,18 @@ void LAN::ProcessDiscovery()
+         snprintf(beacon.SessionName, 64, "%s's game", MyPlayer.Name);
+         beacon.NumPlayers = NumPlayers;
+         beacon.MaxPlayers = MaxPlayers;
+-        beacon.Status = 0; // TODO
++        beacon.Status = DiscoveryStatus; // BananaDS: set by the frontend (0 before)
++        if (HasDiscoveryTag)
++        {
++            // BananaDS: the tag after the name's NUL (the name cut to fit before it)
++            char* t = &beacon.SessionName[kDiscoveryTagOffset];
++            beacon.SessionName[kDiscoveryTagOffset - 1] = '\0';
++            memset(t, 0, 64 - kDiscoveryTagOffset);
++            t[0] = 'B'; t[1] = 'D'; t[2] = 'S'; t[3] = 1;
++            memcpy(&t[4], MyDiscoveryTag.GameCode, 4);
++            t[8] = MyDiscoveryTag.Flags;
++            for (int i = 0; i < 4; i++) t[10 + i] = (char)(DiscoveryNonce >> (8 * i));
++        }
+ 
+         sockaddr_in_t saddr;
+         memset(&saddr, 0, sizeof(saddr));
+@@ -434,7 +584,7 @@ void LAN::ProcessDiscovery()
+ 
+         sendto(DiscoverySocket, (const char*)&beacon, sizeof(beacon), 0, (const sockaddr_t*)&saddr, sizeof(saddr));
+     }
+-    else
++    if (!IsHost || HostListens)   // BananaDS: a host can listen too (its own beacon comes back as well)
+     {
+         Platform::Mutex_Lock(DiscoveryMutex);
+ 
+@@ -494,6 +644,28 @@ void LAN::ProcessDiscovery()
+     }
+ }
+ 
++void LAN::SetDiscoveryTag(const char* gamecode, u8 flags)
++{
++    HasDiscoveryTag = gamecode != nullptr;
++    if (!gamecode) return;
++    memcpy(MyDiscoveryTag.GameCode, gamecode, 4);
++    MyDiscoveryTag.Flags = flags;
++    MyDiscoveryTag.Nonce = DiscoveryNonce;
++}
++
++bool LAN::ReadDiscoveryTag(const DiscoveryData& data, DiscoveryTag& tag)
++{
++    // the visible name has to end before the tag, and the tag has to be there
++    if (strnlen(data.SessionName, kDiscoveryTagOffset) >= (size_t)kDiscoveryTagOffset) return false;
++    const char* t = &data.SessionName[kDiscoveryTagOffset];
++    if (t[0] != 'B' || t[1] != 'D' || t[2] != 'S' || t[3] != 1) return false;
++    memcpy(tag.GameCode, &t[4], 4);
++    tag.Flags = (u8)t[8];
++    tag.Nonce = 0;
++    for (int i = 0; i < 4; i++) tag.Nonce |= (u32)(u8)t[10 + i] << (8 * i);
++    return true;
++}
++
+ void LAN::HostUpdatePlayerList()
+ {
+     u8 cmd[2+sizeof(Players)];
+@@ -573,6 +745,7 @@ void LAN::ProcessHostEvent(ENetEvent& event)
+             if (!player) break;
+ 
+             ConnectedBitmask &= ~(1 << player->ID);
++            MPSetActive(player->ID, false, "disconnected from the LAN session");
+ 
+             int id = player->ID;
+             RemotePeers[id] = nullptr;
+@@ -626,6 +799,7 @@ void LAN::ProcessHostEvent(ENetEvent& event)
+ 
+                     // broadcast updated player list
+                     HostUpdatePlayerList();
++                    SendWifiStateTo(event.peer, hostside->ID, "a new client");
+                 }
+                 break;
+ 
+@@ -636,6 +810,8 @@ void LAN::ProcessHostEvent(ENetEvent& event)
+                     if (!player) break;
+ 
+                     ConnectedBitmask |= (1 << player->ID);
++                    // its wifi just powered on: not in any DS group yet
++                    MPSetActive(player->ID, false, "its wifi powered on");
+                 }
+                 break;
+ 
+@@ -646,6 +822,7 @@ void LAN::ProcessHostEvent(ENetEvent& event)
+                     if (!player) break;
+ 
+                     ConnectedBitmask &= ~(1 << player->ID);
++                    MPSetActive(player->ID, false, "its wifi powered off");
+                 }
+                 break;
+             }
+@@ -688,6 +865,7 @@ void LAN::ProcessClientEvent(ENetEvent& event)
+ 
+             RemotePeers[playerid] = event.peer;
+             event.peer->data = &Players[playerid];
++            SendWifiStateTo(event.peer, playerid, "a client's direct link");
+         }
+         break;
+ 
+@@ -697,6 +875,7 @@ void LAN::ProcessClientEvent(ENetEvent& event)
+             if (!player) break;
+ 
+             ConnectedBitmask &= ~(1 << player->ID);
++            MPSetActive(player->ID, false, "disconnected from the LAN session");
+ 
+             int id = player->ID;
+             RemotePeers[id] = nullptr;
+@@ -762,6 +941,8 @@ void LAN::ProcessClientEvent(ENetEvent& event)
+                     if (!player) break;
+ 
+                     ConnectedBitmask |= (1 << player->ID);
++                    // its wifi just powered on: not in any DS group yet
++                    MPSetActive(player->ID, false, "its wifi powered on");
+                 }
+                 break;
+ 
+@@ -772,6 +953,7 @@ void LAN::ProcessClientEvent(ENetEvent& event)
+                     if (!player) break;
+ 
+                     ConnectedBitmask &= ~(1 << player->ID);
++                    MPSetActive(player->ID, false, "its wifi powered off");
+                 }
+                 break;
+             }
+@@ -862,6 +1044,7 @@ void LAN::ProcessLAN(int type)
+                 header->Magic = (u32)Platform::GetMSCount();
+ 
+                 event.packet->userData = event.peer;
++                MPNoteActivity(event.packet);
+                 RXQueue.push(event.packet);
+ 
+                 // return now -- if we are receiving MP frames, if we keep going
+@@ -892,6 +1075,29 @@ void LAN::Process()
+     ProcessDiscovery();
+     ProcessLAN(0);
+ 
++    if (ConnectedBitmask != landiag::LastBitmask)
++    {
++        Platform::Log(Platform::LogLevel::Debug, "[diag] LAN ConnectedBitmask %04X -> %04X (me=%d, host=%d, last MP host=%d)\n",
++            landiag::LastBitmask, ConnectedBitmask, MyPlayer.ID, IsHost ? 1 : 0, LastHostID);
++        landiag::LastBitmask = ConnectedBitmask;
++    }
++    {
++        u64 now = Platform::GetMSCount();
++        if (landiag::CountStart == 0) landiag::CountStart = now;
++        if ((now - landiag::CountStart) >= 1000)
++        {
++            if (landiag::NSendPkt || landiag::NSendCmd || landiag::NSendReply || landiag::NSendAck ||
++                landiag::NRecvPkt || landiag::NRecvHost || landiag::NHostTimeout)
++                Platform::Log(Platform::LogLevel::Debug,
++                    "[diag] LAN last %llu ms: sent pkt=%d cmd=%d reply=%d ack=%d; got pkt=%d host=%d; host-wait timeouts=%d; connected=%04X\n",
++                    (unsigned long long)(now - landiag::CountStart), landiag::NSendPkt, landiag::NSendCmd, landiag::NSendReply,
++                    landiag::NSendAck, landiag::NRecvPkt, landiag::NRecvHost, landiag::NHostTimeout, ConnectedBitmask);
++            landiag::NSendPkt = landiag::NSendCmd = landiag::NSendReply = landiag::NSendAck = 0;
++            landiag::NRecvPkt = landiag::NRecvHost = landiag::NHostTimeout = 0;
++            landiag::CountStart = now;
++        }
++    }
++
+     FrameCount++;
+     if (FrameCount >= 60)
+     {
+@@ -920,7 +1126,11 @@ void LAN::Begin(int inst)
+     ConnectedBitmask |= (1 << MyPlayer.ID);
+     LastHostID = -1;
+     LastHostPeer = nullptr;
++    MPActiveBitmask = 0;  // our wifi just powered on: nobody is in a DS group with us
++    memset(MPMissCount, 0, sizeof(MPMissCount));
+ 
++    Platform::Log(Platform::LogLevel::Debug, "[diag] LAN Begin: PlayerConnect broadcast (me=%d, connected=%04X)\n",
++        MyPlayer.ID, ConnectedBitmask);
+     u8 cmd = Cmd_PlayerConnect;
+     ENetPacket* pkt = enet_packet_create(&cmd, 1, ENET_PACKET_FLAG_RELIABLE);
+     enet_host_broadcast(Host, Chan_Cmd, pkt);
+@@ -931,7 +1141,11 @@ void LAN::End(int inst)
+     if (!Host) return;
+ 
+     ConnectedBitmask &= ~(1 << MyPlayer.ID);
++    MPActiveBitmask = 0;
++    memset(MPMissCount, 0, sizeof(MPMissCount));
+ 
++    Platform::Log(Platform::LogLevel::Debug, "[diag] LAN End: PlayerDisconnect broadcast (me=%d, connected=%04X)\n",
++        MyPlayer.ID, ConnectedBitmask);
+     u8 cmd = Cmd_PlayerDisconnect;
+     ENetPacket* pkt = enet_packet_create(&cmd, 1, ENET_PACKET_FLAG_RELIABLE);
+     enet_host_broadcast(Host, Chan_Cmd, pkt);
+@@ -942,6 +1156,19 @@ int LAN::SendPacketGeneric(u32 type, u8* packet, int len, u64 timestamp)
+ {
+     if (!Host) return 0;
+ 
++    // our own DS MAC (the transmitter address of the beacons and MP commands we send): RecvReplies' MP-active
++    // tracking only counts auth/association frames addressed to us
++    if (packet && len >= 12 + 24)
++    {
++        u32 t = type & 0xFFFF;
++        u16 fc = packet[12] | (packet[13] << 8);
++        if (t == 1 || (t == 0 && (fc & 0x00FC) == 0x0080))
++        {
++            memcpy(MyMAC, &packet[12 + 10], 6);
++            MyMACKnown = true;
++        }
++    }
++
+     // TODO make the reliable part optional?
+     //u32 flags = ENET_PACKET_FLAG_RELIABLE;
+     u32 flags = ENET_PACKET_FLAG_UNSEQUENCED;
+@@ -979,6 +1206,7 @@ int LAN::RecvPacketGeneric(u8* packet, bool block, u64* timestamp)
+     MPPacketHeader* header = (MPPacketHeader*)&enetpacket->data[0];
+ 
+     u32 len = header->Length;
++    landiag::LastSender = (int)header->SenderID;
+     if (len)
+     {
+         if (len > 2048) len = 2048;
+@@ -1000,27 +1228,40 @@ int LAN::RecvPacketGeneric(u8* packet, bool block, u64* timestamp)
+ 
+ int LAN::SendPacket(int inst, u8* packet, int len, u64 timestamp)
+ {
+-    return SendPacketGeneric(0, packet, len, timestamp);
++    int ret = SendPacketGeneric(0, packet, len, timestamp);
++    landiag::NSendPkt++;
++    landiag::Packet("send", landiag::RSend, packet, len, ret, timestamp, MyPlayer.ID, ConnectedBitmask, -1);
++    return ret;
+ }
+ 
+ int LAN::RecvPacket(int inst, u8* packet, u64* timestamp)
+ {
+-    return RecvPacketGeneric(packet, false, timestamp);
++    int ret = RecvPacketGeneric(packet, false, timestamp);
++    if (ret > 0)
++    {
++        landiag::NRecvPkt++;
++        landiag::Packet("recv", landiag::RRecv, packet, ret, ret, timestamp ? *timestamp : 0, MyPlayer.ID,
++            ConnectedBitmask, landiag::LastSender);
++    }
++    return ret;
+ }
+ 
+ 
+ int LAN::SendCmd(int inst, u8* packet, int len, u64 timestamp)
+ {
++    landiag::NSendCmd++;
+     return SendPacketGeneric(1, packet, len, timestamp);
+ }
+ 
+ int LAN::SendReply(int inst, u8* packet, int len, u64 timestamp, u16 aid)
+ {
++    landiag::NSendReply++;
+     return SendPacketGeneric(2 | (aid<<16), packet, len, timestamp);
+ }
+ 
+ int LAN::SendAck(int inst, u8* packet, int len, u64 timestamp)
+ {
++    landiag::NSendAck++;
+     return SendPacketGeneric(3, packet, len, timestamp);
+ }
+ 
+@@ -1031,10 +1272,18 @@ int LAN::RecvHostPacket(int inst, u8* packet, u64* timestamp)
+         // check if the host is still connected
+ 
+         if (!(ConnectedBitmask & (1<<LastHostID)))
++        {
++            if (landiag::Allow(landiag::RGone, 5, "host gone"))
++                Platform::Log(Platform::LogLevel::Debug, "[diag] LAN RecvHostPacket: host %d not in ConnectedBitmask %04X -> -1\n",
++                    LastHostID, ConnectedBitmask);
+             return -1;
++        }
+     }
+ 
+-    return RecvPacketGeneric(packet, true, timestamp);
++    int ret = RecvPacketGeneric(packet, true, timestamp);
++    if (ret > 0) landiag::NRecvHost++;
++    else landiag::NHostTimeout++;
++    return ret;
+ }
+ 
+ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+@@ -1043,8 +1292,44 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+ 
+     u16 ret = 0;
+     u16 myinstmask = 1 << MyPlayer.ID;
++    u16 alivemask = 0;                 // players a reply came from (even a late one)
++    std::vector<ENetPacket*> deferred; // non-MP frames met while waiting
+ 
+-    if ((myinstmask & ConnectedBitmask) == ConnectedBitmask)
++    // only the LAN players that take part in local MP with us are waited for (MPActiveBitmask, see LAN.h)
++    auto waitmask = [&]() -> u16
++    {
++        return ConnectedBitmask & (MPActiveBitmask | (1 << MyPlayer.ID));
++    };
++    auto finish = [&](bool timedout) -> u16
++    {
++        // non-MP frames (deauth, auth, association requests...) that arrived during the wait go back to the
++        // front of the queue for the regular RX path (CheckRX), in their order, instead of being thrown away
++        // (stamped as received now: the console couldn't look at them while it was blocked here)
++        if (!deferred.empty())
++        {
++            const u32 now = (u32)Platform::GetMSCount();
++            std::queue<ENetPacket*> q;
++            for (ENetPacket* p : deferred)
++            {
++                ((MPPacketHeader*)&p->data[0])->Magic = now;
++                q.push(p);
++            }
++            while (!RXQueue.empty()) { q.push(RXQueue.front()); RXQueue.pop(); }
++            RXQueue.swap(q);
++        }
++        for (int i = 0; i < 16; i++)
++        {
++            if (i == MyPlayer.ID) continue;
++            if (alivemask & (1 << i)) { MPMissCount[i] = 0; continue; }
++            if (!timedout || !(waitmask() & (1 << i))) continue;
++            if (MPMissCount[i] < 255) MPMissCount[i]++;
++            if (MPMissCount[i] >= kMPMaxMisses)
++                MPSetActive(i, false, "no reply to 20 MP commands in a row");
++        }
++        return ret;
++    };
++
++    if ((myinstmask & waitmask()) == waitmask())
+         return 0;
+ 
+     for (;;)
+@@ -1053,17 +1338,33 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+         if (RXQueue.empty())
+         {
+             // no more replies available
+-            return ret;
++            return finish(true);
+         }
+ 
+         ENetPacket* enetpacket = RXQueue.front();
+         RXQueue.pop();
+         MPPacketHeader* header = (MPPacketHeader*)&enetpacket->data[0];
++
++        if ((header->Type & 0xFFFF) == 0)
++        {
++            deferred.push_back(enetpacket);
++                if (landiag::Allow(landiag::RRecv, 20, "recv"))
++                    Platform::Log(Platform::LogLevel::Debug, "[diag] LAN RecvReplies: %s from player %d kept for the regular RX path\n",
++                        enetpacket->dataLength >= sizeof(MPPacketHeader) + 12 + 24
++                            ? landiag::Kind(&enetpacket->data[sizeof(MPPacketHeader)], (int)(enetpacket->dataLength - sizeof(MPPacketHeader)))
++                            : "short frame", (int)header->SenderID);
++            continue;
++        }
++
+         bool good = true;
+         if ((header->Type & 0xFFFF) != 2)
+             good = false;
+-        else if (header->Timestamp < (timestamp - 32))
+-            good = false;
++        else
++        {
++            if (header->SenderID < 16) alivemask |= (1 << header->SenderID);
++            if (header->Timestamp < (timestamp - 32))
++                good = false;
++        }
+ 
+         if (good)
+         {
+@@ -1079,12 +1380,13 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+             }
+ 
+             myinstmask |= (1<<header->SenderID);
+-            if (((myinstmask & ConnectedBitmask) == ConnectedBitmask) ||
++            const u16 wm = waitmask();
++            if (((myinstmask & wm) == wm) ||
+                 ((ret & aidmask) == aidmask))
+             {
+                 // all the clients have sent their reply
+                 enet_packet_destroy(enetpacket);
+-                return ret;
++                return finish(false);
+             }
+         }
+ 
+@@ -1092,4 +1394,62 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+     }
+ }
+ 
++void LAN::SendWifiStateTo(ENetPeer* peer, int id, const char* why)
++{
++    // ConnectedBitmask only learns another player's wifi state from the Cmd_PlayerConnect/Disconnect it broadcasts
++    // as its wifi powers on/off. A player that joins the LAN session afterwards never had it, kept us 'off', and as
++    // our client dropped every join (RecvHostPacket: the host isn't connected). Resent to it, once, as it joins.
++    if (!peer || !(ConnectedBitmask & (1 << MyPlayer.ID))) return;
++    u8 cmd = Cmd_PlayerConnect;
++    ENetPacket* pkt = enet_packet_create(&cmd, 1, ENET_PACKET_FLAG_RELIABLE);
++    enet_peer_send(peer, Chan_Cmd, pkt);
++    Platform::Log(Platform::LogLevel::Debug, "[diag] LAN our wifi is on: told player %d, who just joined (%s)\n", id, why);
++}
++
++void LAN::MPSetActive(int id, bool on, const char* why)
++{
++    if (id < 0 || id >= 16) return;
++    const u16 old = MPActiveBitmask;
++    if (on) MPActiveBitmask |= (1 << id);
++    else MPActiveBitmask &= ~(1 << id);
++    MPMissCount[id] = 0;
++    if (MPActiveBitmask != old)
++        Platform::Log(Platform::LogLevel::Debug, "[diag] LAN player %d %s local MP with us (%s); MP-active %04X -> %04X\n",
++            id, on ? "takes part in" : "no longer takes part in", why, old, MPActiveBitmask);
++}
++
++void LAN::MPNoteActivity(ENetPacket* packet)
++{
++    const MPPacketHeader* header = (const MPPacketHeader*)&packet->data[0];
++    const int id = (int)header->SenderID;
++    if (id < 0 || id >= 16 || id == MyPlayer.ID) return;
++    const u32 type = header->Type & 0xFFFF;
++
++    if (type == 2)
++    {
++        // a MP reply: it is in our DS group (replies are only sent to their host)
++        MPMissCount[id] = 0;
++        if (!(MPActiveBitmask & (1 << id))) MPSetActive(id, true, "MP reply");
++        return;
++    }
++    if (type != 0) return;
++
++    // a regular frame: an auth/association request addressed to us makes it a MP player before its first reply;
++    // a deauth/disassociation addressed to us ends it
++    if (packet->dataLength < sizeof(MPPacketHeader) + 12 + 24) return;
++    const u8* f = &packet->data[sizeof(MPPacketHeader) + 12];
++    const u16 kind = (f[0] | (f[1] << 8)) & 0x00FC;
++    const bool tous = MyMACKnown ? (memcmp(&f[4], MyMAC, 6) == 0) : false;
++    if (kind == 0x00B0 || kind == 0x0000 || kind == 0x0020)
++    {
++        if ((tous || !MyMACKnown) && !(MPActiveBitmask & (1 << id)))
++            MPSetActive(id, true, kind == 0x00B0 ? "auth" : "association request");
++    }
++    else if (kind == 0x00C0 || kind == 0x00A0)
++    {
++        if (tous && (MPActiveBitmask & (1 << id)))
++            MPSetActive(id, false, kind == 0x00C0 ? "deauth" : "disassociation");
++    }
++}
++
+ }
+diff --git a/src/net/LAN.h b/src/net/LAN.h
+index 162c95e..345d864 100644
+--- a/src/net/LAN.h
++++ b/src/net/LAN.h
+@@ -107,6 +107,25 @@ public:
+     int RecvHostPacket(int inst, u8* data, u64* timestamp) override;
+     u16 RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask) override;
+ 
++    // BananaDS (the frontend's menu, on the emulator's thread): the players in a local wireless game with us
++    // (MPActiveBitmask), and the other players connected at all (ENet)
++    u16 GetMPActiveBitmask() const noexcept { return MPActiveBitmask; }
++    u16 GetOtherPlayersBitmask() const noexcept { return (u16)(ConnectedBitmask & ~(1u << MyPlayer.ID)); }
++
++    // BananaDS: a tag in the discovery beacon, hidden after the NUL that ends SessionName, so a frontend can tell
++    // which game a host plays without changing the packet: a melonDS without it shows the name up to the NUL and
++    // ignores the rest. Layout at SessionName[kDiscoveryTagOffset]: "BDS", version 1, the game code (4 bytes), flags,
++    // a padding byte, a nonce (u32, little endian) that is random per LAN object (a frontend finds its own beacon
++    // with it). With a tag, the visible name is cut to kDiscoveryTagOffset - 1 characters.
++    static constexpr int kDiscoveryTagOffset = 40;
++    enum { DiscoveryFlag_Auto = 1 << 0, DiscoveryFlag_Playing = 1 << 1 };
++    struct DiscoveryTag { char GameCode[4]; u8 Flags; u32 Nonce; };
++    void SetDiscoveryTag(const char* gamecode, u8 flags);   // gamecode: 4 characters; nullptr: no tag
++    void SetDiscoveryStatus(u8 status) { DiscoveryStatus = status; }   // the beacon's Status (0 idle, 1 playing)
++    void SetHostListens(bool on) { HostListens = on; }      // a host also reads the others' beacons
++    u32 GetDiscoveryNonce() const { return DiscoveryNonce; }
++    static bool ReadDiscoveryTag(const DiscoveryData& data, DiscoveryTag& tag);
++
+ private:
+     bool Inited;
+     bool Active;
+@@ -119,6 +138,11 @@ private:
+     u32 DiscoveryLastTick;
+     std::map<u32, DiscoveryData> DiscoveryList;
+     Platform::Mutex* DiscoveryMutex;
++    bool HasDiscoveryTag = false;
++    DiscoveryTag MyDiscoveryTag {};
++    u32 DiscoveryNonce = 0;
++    u8 DiscoveryStatus = 0;
++    bool HostListens = false;
+ 
+     Player Players[16];
+     int NumPlayers;
+@@ -135,6 +159,20 @@ private:
+     ENetPeer* LastHostPeer;
+     std::queue<ENetPacket*> RXQueue;
+ 
++    // Local MP host side: the LAN players that take part in local MP with us (they sent us an auth/association
++    // request or MP replies since their wifi last powered on). RecvReplies waits only for these, not for every
++    // LAN-connected player: a console that left the DS group but stays in the LAN session (its game back in a
++    // menu, its wifi powered off and on) sends no replies, and waiting MPRecvTimeout for it on every MP command
++    // stalls the host until its game gives up on that client (~16 s in Mario Kart DS)
++    u16 MPActiveBitmask;
++    u8 MPMissCount[16];  // MP commands in a row a MP-active player didn't reply to (RecvReplies timed out)
++    u8 MyMAC[6];         // this console's DS MAC, from the beacons/MP commands it sends (host side)
++    bool MyMACKnown;
++    void MPSetActive(int id, bool on, const char* why);
++    // H: our wifi is on: tell a peer that just joined (it missed the Cmd_PlayerConnect we broadcast as it powered on)
++    void SendWifiStateTo(ENetPeer* peer, int id, const char* why);
++    void MPNoteActivity(ENetPacket* packet);
++
+     u32 FrameCount;
+ 
+     void ProcessDiscovery();

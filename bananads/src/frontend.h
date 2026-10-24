@@ -33,6 +33,7 @@ void alsa_stop(Alsa* a);
 void alsa_mute(Alsa* a, bool on);
 // (kms.lowlat_trace) the sound thread's backlog (stereo frames queued ahead of ALSA, the stretch's included) and tempo x 1000
 extern std::atomic<int> g_audio_backlog, g_audio_tempo;  // the game's sound faded out (fast-forward: sped-up sound is chopped noise), or back
+void alsa_duck(Alsa* a, float level);  // the game's sound at this level (0-1): lowered under the menu over a running game
 #endif
 
 }  // namespace bananads

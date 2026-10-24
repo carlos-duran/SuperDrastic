@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carlos Duran <15650777+carlos-duran@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 12:00:00 +0000
+Subject: [PATCH] LAN: a child repeats its auth/association request until the
+ parent answers
+
+A BananaDS console could not join a DS group (Mario Kart DS's Create
+group) hosted by stock melonDS 1.0/1.1, while the other way round worked.
+1.0/1.1's SetIRQ13 powers a parent's radio down after every beacon (Mario
+Kart DS's parent: mode 1, auto sleep, a beacon every ~216 ms, awake a few
+ms around it). While it sleeps, only LAN::Process() reads its LAN queue,
+one frame per call, and ProcessLAN drops that frame 16 ms later as stale,
+so a child's single auth or association request reaches the parent's
+game only when it lands in that window: on the device 1 of 5 auth
+requests, seconds apart, was answered. A real DS's radio retries an
+unanswered frame; melonDS sends it once.
+
+A child's auth (sequence 1), association and reassociation requests to a
+unicast address other than melonDS's access point are now kept and sent
+again, with the retry bit, on every Process() call (each frame) from 60 ms
+after the first, until a frame from that parent to us arrives or 1 s has
+passed (a deauth/disassoc stops it too). A copy is then always fresh in
+the parent's queue when it wakes. A parent that doesn't sleep (BananaDS,
+melonDS after 1.1) answers within the first 60 ms and gets no copy, and
+nothing changes for a parent, during MP or in Nintendo WFC.
+---
+ src/net/LAN.cpp | 71 +++++++++++++++++++++++++++++++++++++++++++++++++
+ src/net/LAN.h   | 11 ++++++++
+ 2 files changed, 82 insertions(+)
+
+diff --git a/src/net/LAN.cpp b/src/net/LAN.cpp
+index 3b3db01..078b7ea 100644
+--- a/src/net/LAN.cpp
++++ b/src/net/LAN.cpp
+@@ -468,6 +468,7 @@ void LAN::EndSession()
+     if (IsHost) EndDiscovery();
+ 
+     Active = false;
++    RepeatFrame.clear();
+ 
+     while (!RXQueue.empty())
+     {
+@@ -1045,6 +1046,7 @@ void LAN::ProcessLAN(int type)
+ 
+                 event.packet->userData = event.peer;
+                 MPNoteActivity(event.packet);
++                RepeatAnswered(event.packet);
+                 RXQueue.push(event.packet);
+ 
+                 // return now -- if we are receiving MP frames, if we keep going
+@@ -1074,6 +1076,7 @@ void LAN::Process()
+ 
+     ProcessDiscovery();
+     ProcessLAN(0);
++    RepeatTick();
+ 
+     if (ConnectedBitmask != landiag::LastBitmask)
+     {
+@@ -1152,6 +1155,72 @@ void LAN::End(int inst)
+ }
+ 
+ 
++// Joining a DS group hosted by melonDS 1.0/1.1. Its Wifi::SetIRQ13 powers a parent's radio down after every
++// beacon (Mario Kart DS's parent: mode 1, auto sleep on, a beacon every ~216 ms, awake a few ms around it).
++// While it sleeps nothing reads its LAN queue but LAN::Process(), which takes one frame per call and drops it
++// 16 ms later as stale, so a child's single auth/association request reaches its game only if it lands in that
++// window (device logs: 1 of 5 requests answered, seconds apart). A real DS's radio retries an unanswered frame;
++// we do it here: the request is sent again, with the retry bit, on every Process() call (each frame) from 60 ms
++// on, until the parent sends us a frame or 1 s has passed, so one is always fresh when the parent wakes. A parent
++// that doesn't sleep (BananaDS, melonDS after 1.1) answers within the first 60 ms and never gets a copy.
++void LAN::RepeatCheck(const u8* packet, u32 type, int len, u64 timestamp)
++{
++    if (!packet || (type & 0xFFFF) != 0 || len < 12 + 24) return;
++
++    const u8* f = &packet[12];
++    const u16 sub = (f[0] | (f[1] << 8)) & 0x00FC;
++    if (sub == 0x00C0 || sub == 0x00A0)  // deauth/disassoc: we're leaving
++    {
++        RepeatFrame.clear();
++        return;
++    }
++
++    const bool authreq = (sub == 0x00B0) && len >= 12 + 24 + 6 && (f[24 + 2] | (f[24 + 3] << 8)) == 1;
++    const bool assocreq = (sub == 0x0000) || (sub == 0x0020);
++    if (!authreq && !assocreq) return;
++    static const u8 apmac[6] = {0x00, 0xF0, 0x77, 0x77, 0x77, 0x77};  // melonDS's access point (WifiAP::APMac)
++    if ((f[4] & 0x01) || memcmp(&f[4], apmac, 6) == 0) return;
++
++    RepeatFrame.assign(packet, packet + len);
++    RepeatFrame[12 + 1] |= 0x08;  // retry
++    RepeatTimestamp = timestamp;  // kept: melonDS widens its post-beacon window for an auth/assoc frame with one
++    RepeatStart = (u32)Platform::GetMSCount();
++    Platform::Log(Platform::LogLevel::Debug, "[diag] LAN repeat: %s to %02X:%02X:%02X:%02X:%02X:%02X held until answered\n",
++        authreq ? "auth" : "assoc-req", f[4], f[5], f[6], f[7], f[8], f[9]);
++}
++
++void LAN::RepeatAnswered(ENetPacket* packet)
++{
++    if (RepeatFrame.empty() || packet->dataLength < sizeof(MPPacketHeader) + 12 + 24) return;
++
++    // any frame from the parent to us (its auth/association response)
++    const u8* f = &packet->data[sizeof(MPPacketHeader) + 12];
++    if (memcmp(&f[10], &RepeatFrame[12 + 4], 6) == 0 && memcmp(&f[4], &RepeatFrame[12 + 10], 6) == 0)
++    {
++        Platform::Log(Platform::LogLevel::Debug, "[diag] LAN repeat: answered after %u ms\n",
++            (u32)Platform::GetMSCount() - RepeatStart);
++        RepeatFrame.clear();
++    }
++}
++
++void LAN::RepeatTick()
++{
++    if (RepeatFrame.empty()) return;
++
++    const u32 age = (u32)Platform::GetMSCount() - RepeatStart;
++    if (age >= 1000)
++    {
++        Platform::Log(Platform::LogLevel::Debug, "[diag] LAN repeat: no answer in 1 s, given up\n");
++        RepeatFrame.clear();
++        return;
++    }
++    if (age < 60) return;
++
++    Repeating = true;
++    SendPacketGeneric(0, RepeatFrame.data(), (int)RepeatFrame.size(), RepeatTimestamp);
++    Repeating = false;
++}
++
+ int LAN::SendPacketGeneric(u32 type, u8* packet, int len, u64 timestamp)
+ {
+     if (!Host) return 0;
+@@ -1169,6 +1238,8 @@ int LAN::SendPacketGeneric(u32 type, u8* packet, int len, u64 timestamp)
+         }
+     }
+ 
++    if (!Repeating) RepeatCheck(packet, type, len, timestamp);
++
+     // TODO make the reliable part optional?
+     //u32 flags = ENET_PACKET_FLAG_RELIABLE;
+     u32 flags = ENET_PACKET_FLAG_UNSEQUENCED;
+diff --git a/src/net/LAN.h b/src/net/LAN.h
+index 345d864..441512b 100644
+--- a/src/net/LAN.h
++++ b/src/net/LAN.h
+@@ -173,6 +173,17 @@ private:
+     void SendWifiStateTo(ENetPeer* peer, int id, const char* why);
+     void MPNoteActivity(ENetPacket* packet);
+ 
++    // A local MP child's auth (seq 1) or association request, sent again every frame until the parent answers
++    // (or 1 s). melonDS 1.0/1.1 as a parent powers its radio down after every beacon (~200 ms), and its LAN drops
++    // a frame that came in while it was asleep, so one request rarely reaches it (see SendPacketGeneric)
++    std::vector<u8> RepeatFrame;
++    u64 RepeatTimestamp = 0;
++    u32 RepeatStart = 0;
++    bool Repeating = false;
++    void RepeatCheck(const u8* packet, u32 type, int len, u64 timestamp);
++    void RepeatAnswered(ENetPacket* packet);
++    void RepeatTick();
++
+     u32 FrameCount;
+ 
+     void ProcessDiscovery();

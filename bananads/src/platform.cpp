@@ -203,7 +203,11 @@ void WriteNDSSave(const u8* data, u32 len, u32 off, u32 n, void* userdata) {
     if (userdata) Emu::from(userdata)->write_save(data, len, off, n);
 }
 void WriteGBASave(const u8*, u32, u32, u32, void*) {}       // no GBA slot on the handhelds
-void WriteFirmware(const Firmware&, u32, u32, void*) {}      // the firmware is generated at every start
+// The firmware is generated at every start; of what the game writes into it only the Wi-Fi access points (with
+// the Nintendo WFC ID) are kept, in wifi.wfc_settings (Emu::write_firmware), as melonDS's own frontend does
+void WriteFirmware(const Firmware& fw, u32, u32, void* userdata) {
+    if (userdata) Emu::from(userdata)->write_firmware(fw);
+}
 void WriteDateTime(int, int, int, int, int, int, void*) {}   // the DS's clock follows the handheld's
 
 // --- local wireless (DS to DS) ---
@@ -211,15 +215,18 @@ void WriteDateTime(int, int, int, int, int, int, void*) {}   // the DS's clock f
 // sees no other DS nearby.
 
 #ifdef BANANADS_LAN
-void MP_Begin(void*) { MPInterface::Get().Begin(0); }
-void MP_End(void*) { MPInterface::Get().End(0); }
-int MP_SendPacket(u8* d, int l, u64 ts, void*) { return MPInterface::Get().SendPacket(0, d, l, ts); }
-int MP_RecvPacket(u8* d, u64* ts, void*) { return MPInterface::Get().RecvPacket(0, d, ts); }
-int MP_SendCmd(u8* d, int l, u64 ts, void*) { return MPInterface::Get().SendCmd(0, d, l, ts); }
-int MP_SendReply(u8* d, int l, u64 ts, u16 aid, void*) { return MPInterface::Get().SendReply(0, d, l, ts, aid); }
-int MP_SendAck(u8* d, int l, u64 ts, void*) { return MPInterface::Get().SendAck(0, d, l, ts); }
-int MP_RecvHostPacket(u8* d, u64* ts, void*) { return MPInterface::Get().RecvHostPacket(0, d, ts); }
-u16 MP_RecvReplies(u8* d, u64 ts, u16 m, void*) { return MPInterface::Get().RecvReplies(0, d, ts, m); }
+// (a frame run ahead, Emu::hidden: nothing goes out or is taken in, as with Net_*; run-ahead is off while a LAN
+// session or discovery is on, Emu::runahead_ok)
+static bool mp_hidden(void* u) { return u && Emu::from(u)->hidden(); }
+void MP_Begin(void* u) { if (!mp_hidden(u)) MPInterface::Get().Begin(0); }
+void MP_End(void* u) { if (!mp_hidden(u)) MPInterface::Get().End(0); }
+int MP_SendPacket(u8* d, int l, u64 ts, void* u) { return mp_hidden(u) ? l : MPInterface::Get().SendPacket(0, d, l, ts); }
+int MP_RecvPacket(u8* d, u64* ts, void* u) { return mp_hidden(u) ? 0 : MPInterface::Get().RecvPacket(0, d, ts); }
+int MP_SendCmd(u8* d, int l, u64 ts, void* u) { return mp_hidden(u) ? l : MPInterface::Get().SendCmd(0, d, l, ts); }
+int MP_SendReply(u8* d, int l, u64 ts, u16 aid, void* u) { return mp_hidden(u) ? l : MPInterface::Get().SendReply(0, d, l, ts, aid); }
+int MP_SendAck(u8* d, int l, u64 ts, void* u) { return mp_hidden(u) ? l : MPInterface::Get().SendAck(0, d, l, ts); }
+int MP_RecvHostPacket(u8* d, u64* ts, void* u) { return mp_hidden(u) ? 0 : MPInterface::Get().RecvHostPacket(0, d, ts); }
+u16 MP_RecvReplies(u8* d, u64 ts, u16 m, void* u) { return mp_hidden(u) ? 0 : MPInterface::Get().RecvReplies(0, d, ts, m); }
 #else
 void MP_Begin(void*) {}
 void MP_End(void*) {}

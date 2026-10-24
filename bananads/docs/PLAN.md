@@ -79,7 +79,7 @@ Mali GPUs with GLES 3.2, so neither runs as it is. The options, to choose with B
 - **Online:** with `wifi.dns=kaeru` (or `altwfc`, `wiilink`), Mario Kart DS gets to its Nintendo WFC menu and finds
   a race. Pokémon Platinum/HGSS reach the GTS. The setup happens in each game's Nintendo WFC settings, and needs
   a connection made once. `log.level=0` shows every DNS query going to the WFC server.
-- **Local:** two handhelds on one network, `wifi.local=host` and `wifi.local=join:<address>`. Mario Kart DS's
+- **Local:** two handhelds on one network, `wifi.local=host` and `wifi.local=join:<address>`, or `auto` on both. Mario Kart DS's
   multi-card play, a Pokémon trade, PictoChat.
 - Worth checking: whether slirp's polling costs much CPU on the A55 (it runs on the emulator's thread). If it
   does, SuperDrastic's `wfcnet.c` is the lighter fallback.
