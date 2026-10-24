@@ -1,0 +1,476 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carlos Duran <15650777+carlos-duran@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 12:00:00 +0000
+Subject: [PATCH] Wifi: the radio kept on at the end of the post-beacon window
+ in local wireless play
+
+SetIRQ13's automatic power-down (W_POWER_TX bit1 clear) at the end of the post-beacon window:
+- melonDS 1.1 turned the radio off in every mode but 3. A Mario Kart DS parent (mode 1, auto sleep on) then slept
+  after each beacon, so over LAN its children's auth/association frames rarely landed while it was awake.
+- 906e9eb (#2681) turns it off only in mode 0, which keeps a Mario Kart DS child (mode 2, W_POWER_TX=1) awake
+  when it has to sleep to follow its parent: it could never join a group.
+Now: never in manual mode (3), never for an MP parent sending beacons (IsMP && !IsMPClient), never in mode 2 with
+the auto wake-up off (dswifi, #2680/#2681); associated with melonAP (Nintendo WFC) 906e9eb's rule (mode 0 only);
+otherwise melonDS 1.1's rule, which a joining child needs. Adds "[diag]" traces (Debug level, rate-limited) of
+IRQ13's decisions, the frames sent and received, and the MP state.
+---
+ src/Wifi.cpp | 260 +++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 234 insertions(+), 26 deletions(-)
+
+diff --git a/src/Wifi.cpp b/src/Wifi.cpp
+index 89bdb02..fd3f705 100644
+--- a/src/Wifi.cpp
++++ b/src/Wifi.cpp
+@@ -88,6 +88,121 @@ bool MACIsBroadcast(const u8* a)
+     return (*(u32*)&a[0] == 0xFFFFFFFF) && (*(u16*)&a[4] == 0xFFFF);
+ }
+ 
++// BananaDS diagnostics: Debug level (BananaDS log.level 0), "[diag]" prefix, each category at most N lines a second
++// (the lines held back are counted and reported with the category's next line)
++namespace diag
++{
++struct Rate { u64 Start; int N; int Held; };
++static Rate RTxMgmt, RTxMP, RTxData, RTxBeacon, RTxNoChan, RRxMgmt, RRxMP, RRxData, RRxDrop, RRxOk, RCom, RHostGone;
++
++static bool Allow(Rate& r, int max, const char* cat)
++{
++    u64 now = Platform::GetMSCount();
++    if (r.Start == 0 || (now - r.Start) >= 1000)
++    {
++        if (r.Held)
++            Log(LogLevel::Debug, "[diag] (%s: %d more lines not shown in the last second)\n", cat, r.Held);
++        r.Start = now; r.N = 0; r.Held = 0;
++    }
++    if (r.N < max) { r.N++; return true; }
++    r.Held++;
++    return false;
++}
++
++static const u8 kCmd[6]   = {0x03, 0x09, 0xBF, 0x00, 0x00, 0x00};
++static const u8 kReply[6] = {0x03, 0x09, 0xBF, 0x00, 0x00, 0x10};
++static const u8 kAck[6]   = {0x03, 0x09, 0xBF, 0x00, 0x00, 0x03};
++
++struct MacStr { char S[18]; };
++static MacStr Mac(const u8* m)
++{
++    MacStr r;
++    snprintf(r.S, sizeof(r.S), "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
++    return r;
++}
++
++// 0 management (not beacon), 1 MP CMD/REPLY/ACK, 2 data/control, 3 beacon
++static int Class(const u8* h)
++{
++    if (MACEqual(&h[4], kCmd) || MACEqual(&h[16], kReply) || MACEqual(&h[4], kReply) || MACEqual(&h[4], kAck))
++        return 1;
++    u16 fc = *(const u16*)h;
++    if (((fc >> 2) & 3) == 0) return (((fc >> 4) & 0xF) == 8) ? 3 : 0;
++    return 2;
++}
++
++static const char* Kind(const u8* h)
++{
++    if (MACEqual(&h[4], kCmd)) return "MP-CMD";
++    if (MACEqual(&h[16], kReply) || MACEqual(&h[4], kReply)) return "MP-REPLY";
++    if (MACEqual(&h[4], kAck)) return "MP-ACK";
++    u16 fc = *(const u16*)h;
++    u16 type = (fc >> 2) & 3, sub = (fc >> 4) & 0xF;
++    static const char* mgmt[16] = {"assoc-req", "assoc-resp", "reassoc-req", "reassoc-resp", "probe-req",
++        "probe-resp", "mgmt-6", "mgmt-7", "beacon", "ATIM", "disassoc", "auth", "deauth", "action", "mgmt-14", "mgmt-15"};
++    if (type == 0) return mgmt[sub];
++    if (type == 1) return "ctrl";
++    if (type == 2) return "data";
++    return "type-3";
++}
++
++// buf: a frame with melonDS's 12-byte TX/RX header in front of the 802.11 header; len: buf's length
++static void Frame(const char* dir, Rate* rates, const u8* buf, int len, const char* note, u64 ts)
++{
++    if (len < 12 + 24) return;
++    const u8* h = &buf[12];
++    int c = Class(h);
++    static const int max[4] = {60, 10, 10, 2};
++    static const char* cat[4] = {"mgmt", "MP", "data", "beacon"};
++    char label[24];
++    snprintf(label, sizeof(label), "%s %s", dir, cat[c]);
++    if (!Allow(rates[c], max[c], label)) return;
++
++    char extra[64] = "";
++    u16 fc = *(const u16*)h;
++    u16 sub = (fc >> 4) & 0xF;
++    int bodylen = len - 12 - 24;
++    if (c == 0 && sub == 0xB && bodylen >= 6)       // auth: algorithm, sequence, status
++        snprintf(extra, sizeof(extra), " auth alg=%d seq=%d status=%d", *(const u16*)&h[24], *(const u16*)&h[26], *(const u16*)&h[28]);
++    else if (c == 0 && (sub == 0x1 || sub == 0x3) && bodylen >= 6)  // assoc resp: capability, status, AID
++        snprintf(extra, sizeof(extra), " cap=%04X status=%d aid=%04X", *(const u16*)&h[24], *(const u16*)&h[26], *(const u16*)&h[28]);
++    else if (c == 0 && (sub == 0x0 || sub == 0x2) && bodylen >= 4)  // assoc req: capability, listen interval
++        snprintf(extra, sizeof(extra), " cap=%04X listen=%d", *(const u16*)&h[24], *(const u16*)&h[26]);
++    else if (c == 0 && (sub == 0xA || sub == 0xC) && bodylen >= 2)  // disassoc/deauth: reason
++        snprintf(extra, sizeof(extra), " reason=%d", *(const u16*)&h[24]);
++    else if (c == 1 && MACEqual(&h[4], kCmd) && bodylen >= 4)
++        snprintf(extra, sizeof(extra), " clienttime=%d clientmask=%04X", *(const u16*)&h[24], *(const u16*)&h[26]);
++
++    Log(LogLevel::Debug, "[diag] %s %s fc=%04X dst=%s src=%s a3=%s seq=%d ch=%d rate=%02X len=%d ts=%llu%s%s%s\n",
++        dir, Kind(h), fc, Mac(&h[4]).S, Mac(&h[10]).S, Mac(&h[16]).S, (*(const u16*)&h[22]) >> 4,
++        buf[9], buf[8], len, (unsigned long long)ts, extra, note ? " " : "", note ? note : "");
++}
++
++static Rate TxRates[4], RxRates[4];
++
++static void IRQ13State(u16 modewep, u16 powertx, u16 powerdownctrl, bool ismp, bool ismpclient, const u8* bssid,
++                       bool apassoc, bool powerdown)
++{
++    static u64 last = ~0ULL;
++    u64 cur = (modewep & 0x7F) | ((powertx & 3) << 8) | ((powerdownctrl & 3) << 12) | (powerdown ? (1 << 16) : 0)
++            | (ismp ? (1 << 17) : 0) | (ismpclient ? (1 << 18) : 0)
++            | ((u64)bssid[3] << 24) | ((u64)bssid[4] << 32) | ((u64)bssid[5] << 40) | ((u64)bssid[0] << 48);
++    if (cur == last) return;
++    last = cur;
++    const int mode = modewep & 7;
++    const bool sleepon = !(powertx & 2);
++    // what the power-down request then does: W_POWERDOWNCTRL bit0 inhibits it (UpdatePowerStatus)
++    const char* effect = !powerdown ? "stays on" : ((powerdownctrl & 1) ? "power-down requested, inhibited by PowerDownCtrl bit0" : "auto power-down");
++    Log(LogLevel::Debug, "[diag] IRQ13: ModeWEP=%04X (mode %d) PowerTX=%d PowerDownCtrl=%d IsMP=%d IsMPClient=%d (%s) BSSID=%s%s -> %s"
++        " (D rule; 1.1 would %s, 906e9eb would %s)\n",
++        modewep, mode, powertx & 3, powerdownctrl & 3, ismp, ismpclient,
++        (ismp && !ismpclient) ? "MP host" : (ismpclient ? "MP client" : "not in MP"),
++        Mac(bssid).S, apassoc ? " (melonAP)" : "", effect,
++        ((mode != 3) && sleepon) ? "request power-down" : "stay on",
++        ((mode == 0) && sleepon) ? "request power-down" : "stay on");
++}
++}
++
+ 
+ Wifi::Wifi(melonDS::NDS& nds) : NDS(nds)
+ {
+@@ -354,6 +469,7 @@ void Wifi::UpdatePowerOn()
+ 
+         ScheduleTimer(true);
+ 
++        Log(LogLevel::Debug, "[diag] wifi powered on: MP_Begin\n");
+         Platform::MP_Begin(NDS.UserData);
+     }
+     else
+@@ -362,6 +478,7 @@ void Wifi::UpdatePowerOn()
+ 
+         NDS.CancelEvent(Event_Wifi);
+ 
++        Log(LogLevel::Debug, "[diag] wifi powered off: MP_End\n");
+         Platform::MP_End(NDS.UserData);
+     }
+ }
+@@ -393,13 +510,33 @@ void Wifi::SetIRQ13()
+ {
+     SetIRQ(13);
+ 
+-    // auto power-down should only happen in automatic power saving mode (0).
+-    // it must not happen when power saving is disabled (mode 2): stations
+-    // running in that mode (eg. dswifi in infrastructure mode) don't service
+-    // IRQ13/IRQ15, so a power-down triggered by the one-shot W_BeaconCount2
+-    // countdown (armed at 0xFFFF = ~67s) would turn the transceiver off
+-    // with nothing ever waking it up again
+-    if ((IOPORT(W_ModeWEP) & 0x7) == 0)
++    // auto power-down at IRQ13 (the post-beacon countdown reaching 0), if W_POWER_TX bit1
++    // (auto sleep) is clear and:
++    // * not mode 3 (manual power management: POWERSTATE; melonDS 1.1 and 906e9eb agree)
++    // * not while this console is a local MP host (a parent beaconing: IsMP && !IsMPClient). Mario Kart DS's
++    //   parent runs in mode 1 with auto sleep on and would sleep right after every beacon; over LAN the children's
++    //   auth/assoc frames then never land in its awake window (seen on the handhelds)
++    // * associated with melonAP (BSSID = WifiAP::APMac: infrastructure, i.e. Nintendo WFC through slirp, and
++    //   dswifi): 906e9eb's rule, mode 0 only, so WFC behaves as in BananaDS 0.4.2
++    // * not mode 2 with auto wakeup (W_POWER_TX bit0) off: #2680's case (dswifi: W_POWER_TX=0, power saving
++    //   disabled, IRQ13/15 never serviced: a power-down there is never undone), also before it is associated
++    // * otherwise as melonDS 1.1: a DS child joining a group (mode 2 with W_POWER_TX=1 while associating in
++    //   Mario Kart DS) needs it to join: with 906e9eb's rule alone the child never joined
++    const u16 sleepmode = IOPORT(W_ModeWEP) & 0x7;
++    const bool mphost = IsMP && !IsMPClient;
++    const bool apassoc = MACEqual((u8*)&IOPORT(W_BSSID0), WifiAP::APMac);
++    bool autosleep;
++    if (sleepmode == 3 || mphost)
++        autosleep = false;
++    else if (apassoc)
++        autosleep = (sleepmode == 0);
++    else if (sleepmode == 2 && !(IOPORT(W_PowerTX) & (1<<0)))
++        autosleep = false;
++    else
++        autosleep = true;
++    diag::IRQ13State(IOPORT(W_ModeWEP), IOPORT(W_PowerTX), IOPORT(W_PowerDownCtrl), IsMP, IsMPClient,
++                     (u8*)&IOPORT(W_BSSID0), apassoc, autosleep && !(IOPORT(W_PowerTX) & (1<<1)));
++    if (autosleep)
+     {
+         if (!(IOPORT(W_PowerTX) & (1<<1)))
+         {
+@@ -648,9 +785,19 @@ void Wifi::TXSendFrame(const TXSlot* slot, int num)
+     if (noseqno == 2)
+         *(u16*)&TXBuffer[0xC] |= (1<<11);
+ 
+-    if (CurChannel == 0) return;
++    if (CurChannel == 0)
++    {
++        if (diag::Allow(diag::RTxNoChan, 5, "TX no channel"))
++            Log(LogLevel::Debug, "[diag] TX slot %d dropped: CurChannel is 0\n", num);
++        return;
++    }
+     TXBuffer[9] = CurChannel;
+ 
++    {
++        static const char* slotname[6] = {"slot=loc1", "slot=cmd", "slot=loc2", "slot=loc3", "slot=beacon", "slot=reply"};
++        diag::Frame("TX", diag::TxRates, TXBuffer, 12+len, (num >= 0 && num < 6) ? slotname[num] : "slot=?", USTimestamp);
++    }
++
+     switch (num)
+     {
+     case 0:
+@@ -828,6 +975,7 @@ void Wifi::SendMPDefaultReply()
+     *(u16*)&reply[0xC + 0x16] = IOPORT(W_TXSeqNo) << 4;
+     *(u32*)&reply[0xC + 0x18] = 0;
+ 
++    diag::Frame("TX", diag::TxRates, reply, 12+28, "default-reply", USTimestamp);
+     int txlen = Platform::MP_SendReply(reply, 12+28, USTimestamp, IOPORT(W_AIDLow), NDS.UserData);
+     WIFI_LOG("wifi: sent %d/40 bytes of MP default reply\n", txlen);
+ }
+@@ -938,6 +1086,7 @@ void Wifi::SendMPAck(u16 cmdcount, u16 clientfail)
+         *(u32*)&ack[0] = PreambleLen(TXSlots[1].Rate);
+     }
+ 
++    diag::Frame("TX", diag::TxRates, ack, 12+32, "ack", USTimestamp);
+     int txlen = Platform::MP_SendAck(ack, 12+32, USTimestamp, NDS.UserData);
+     WIFI_LOG("wifi: sent %d/44 bytes of MP ack, %d %d\n", txlen, ComStatus, RXTime);
+ }
+@@ -1242,6 +1391,15 @@ void Wifi::StartRX()
+     ComStatus |= 1;
+ }
+ 
++// [diag] a non-beacon frame CheckRX took that FinishRX's address/BSSID/RXFILTER checks then drop
++#define DIAG_RXDROP() do { \
++        if (diag::Class(&RXBuffer[12]) != 3 && diag::Allow(diag::RRxDrop, 20, "RX dropped")) \
++            Log(LogLevel::Debug, "[diag] RX dropped by FinishRX (Wifi.cpp:%d) %s fc=%04X dst=%s src=%s a3=%s mymac=%s bssid=%s rxfilter=%04X rxfilter2=%04X\n", \
++                __LINE__, diag::Kind(&RXBuffer[12]), *(u16*)&RXBuffer[12], diag::Mac(&RXBuffer[12+4]).S, diag::Mac(&RXBuffer[12+10]).S, \
++                diag::Mac(&RXBuffer[12+16]).S, diag::Mac((u8*)&IOPORT(W_MACAddr0)).S, diag::Mac((u8*)&IOPORT(W_BSSID0)).S, \
++                IOPORT(W_RXFilter), IOPORT(W_RXFilter2)); \
++    } while (0)
++
+ void Wifi::FinishRX()
+ {
+     ComStatus &= ~0x1;
+@@ -1271,7 +1429,7 @@ void Wifi::FinishRX()
+     if (!(dstmac[0] & 0x01))
+     {
+         if (!MACEqual(dstmac, (u8*)&IOPORT(W_MACAddr0)))
+-            return;
++            { DIAG_RXDROP(); return; }
+     }
+ 
+     // reject the frame if it's a WEP frame and WEP is off
+@@ -1280,7 +1438,7 @@ void Wifi::FinishRX()
+     if (framectl & (1<<14))
+     {
+         if (!(IOPORT(W_WEPCnt) & (1<<15)))
+-            return;
++            { DIAG_RXDROP(); return; }
+     }
+ 
+     // apply RX filtering
+@@ -1306,7 +1464,7 @@ void Wifi::FinishRX()
+                 if (!(rxflags & 0x8000))
+                 {
+                     if (!(IOPORT(W_RXFilter) & (1<<0)))
+-                        return;
++                        { DIAG_RXDROP(); return; }
+                 }
+ 
+                 rxflags |= 0x0001;
+@@ -1318,7 +1476,7 @@ void Wifi::FinishRX()
+                 {
+                     // CHECKME!
+                     if (!(IOPORT(W_RXFilter) & (3<<9)))
+-                        return;
++                        { DIAG_RXDROP(); return; }
+                 }
+             }
+         }
+@@ -1335,13 +1493,13 @@ void Wifi::FinishRX()
+                 if (!(rxflags & 0x8000))
+                 {
+                     if (!(IOPORT(W_RXFilter) & (1<<11)))
+-                        return;
++                        { DIAG_RXDROP(); return; }
+                 }
+ 
+                 rxflags |= 0x0005;
+             }
+             else
+-                return;
++                { DIAG_RXDROP(); return; }
+         }
+         break;
+ 
+@@ -1349,7 +1507,7 @@ void Wifi::FinishRX()
+         {
+             u16 fromto = (framectl >> 8) & 0x3;
+             if (IOPORT(W_RXFilter2) & (1<<fromto))
+-                return;
++                { DIAG_RXDROP(); return; }
+ 
+             int bssidoffset[4] = {16, 4, 10, 0};
+             if (bssidoffset[fromto])
+@@ -1364,13 +1522,13 @@ void Wifi::FinishRX()
+             if (!(rxflags & 0x8000))
+             {
+                 if (!(rxfilter & (1<<11)))
+-                    return;
++                    { DIAG_RXDROP(); return; }
+             }
+ 
+             if (framectl & (1<<11)) // retransmit
+             {
+                 if (!(rxfilter & (1<<0)))
+-                    return;
++                    { DIAG_RXDROP(); return; }
+             }
+ 
+             // check for MP frames
+@@ -1413,23 +1571,23 @@ void Wifi::FinishRX()
+             case 0x1:
+                 if ((rxflags & 0xF) == 0xD)
+                 {
+-                    if (!(rxfilter & (1<<7))) return;
++                    if (!(rxfilter & (1<<7))) { DIAG_RXDROP(); return; }
+                 }
+                 else if ((rxflags & 0xF) != 0xE)
+                 {
+-                    if (!(rxfilter & (1<<1))) return;
++                    if (!(rxfilter & (1<<1))) { DIAG_RXDROP(); return; }
+                 }
+                 break;
+ 
+             case 0x2:
+                 if ((rxflags & 0xF) != 0xC)
+                 {
+-                    if (!(rxfilter & (1<<2))) return;
++                    if (!(rxfilter & (1<<2))) { DIAG_RXDROP(); return; }
+                 }
+                 break;
+ 
+             case 0x3:
+-                if (!(rxfilter & (1<<3))) return;
++                if (!(rxfilter & (1<<3))) { DIAG_RXDROP(); return; }
+                 break;
+ 
+             case 0x4: break;
+@@ -1437,24 +1595,24 @@ void Wifi::FinishRX()
+             case 0x5:
+                 if ((rxflags & 0xF) == 0xF)
+                 {
+-                    if (!(rxfilter & (1<<8))) return;
++                    if (!(rxfilter & (1<<8))) { DIAG_RXDROP(); return; }
+                 }
+                 else
+                 {
+-                    if (!(rxfilter & (1<<4))) return;
++                    if (!(rxfilter & (1<<4))) { DIAG_RXDROP(); return; }
+                 }
+                 break;
+ 
+             case 0x6:
+-                if (!(rxfilter & (1<<5))) return;
++                if (!(rxfilter & (1<<5))) { DIAG_RXDROP(); return; }
+                 break;
+ 
+             case 0x7:
+-                if (!(rxfilter & (1<<6))) return;
++                if (!(rxfilter & (1<<6))) { DIAG_RXDROP(); return; }
+                 break;
+ 
+             default:
+-                return;
++                { DIAG_RXDROP(); return; }
+             }
+         }
+         break;
+@@ -1482,7 +1640,13 @@ void Wifi::FinishRX()
+         IOPORT(W_RXBufWriteCursor) = (addr & ~0x3) >> 1;
+ 
+         SetIRQ(0);
++
++        if (diag::Class(&RXBuffer[12]) == 0 && diag::Allow(diag::RRxOk, 30, "RX delivered"))
++            Log(LogLevel::Debug, "[diag] RX delivered to the game: %s src=%s rxflags=%04X\n",
++                diag::Kind(&RXBuffer[12]), diag::Mac(&RXBuffer[12+10]).S, rxflags);
+     }
++    else if (diag::Allow(diag::RRxDrop, 20, "RX dropped"))
++        Log(LogLevel::Debug, "[diag] RX MP-CMD duplicate seqno %d ignored\n", seqno >> 4);
+ 
+     if ((rxflags & 0x800F) == 0x800C)
+     {
+@@ -1500,6 +1664,9 @@ void Wifi::FinishRX()
+             // in the case this client wasn't ready to send a reply
+             // TODO: also send this if we have RX disabled
+ 
++            if (diag::Allow(diag::TxRates[1], 10, "TX MP"))
++                Log(LogLevel::Debug, "[diag] TX MP-REPLY blank (AID=%d, clientmask=%04X) ts=%llu\n",
++                    IOPORT(W_AIDLow), clientmask, (unsigned long long)USTimestamp);
+             Platform::MP_SendReply(nullptr, 0, USTimestamp, 0, NDS.UserData);
+         }
+     }
+@@ -1593,6 +1760,8 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
+             rxlen = Platform::MP_RecvHostPacket(RXBuffer, &timestamp, NDS.UserData);
+             if (rxlen < 0)
+             {
++                if (diag::Allow(diag::RHostGone, 5, "host gone"))
++                    Log(LogLevel::Debug, "[diag] MP_RecvHostPacket: host is gone (-1), leaving MP\n");
+                 // host is gone
+                 // TODO: make this more resilient
+                 IsMP = false;
+@@ -1628,6 +1797,9 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
+             }
+         }
+ 
++        if (diag::Class(&RXBuffer[12]) != 3)
++            diag::Frame("RX", diag::RxRates, RXBuffer, rxlen, type == 0 ? "via=MP_RecvPacket" : "via=MP_RecvHostPacket", timestamp);
++
+         framectl = *(u16*)&RXBuffer[12+0];
+         txrate = RXBuffer[8];
+ 
+@@ -1760,6 +1932,42 @@ void Wifi::USTimer(u32 param)
+ {
+     USTimestamp += kTimerInterval;
+ 
++    {
++        // [diag] MP state, ComStatus, AID and BSSID changes
++        static int lastmp = -1;
++        static u32 lastcom = 0xFFFFFFFF;
++        static u32 lastaid = 0xFFFFFFFF;
++        static u64 lastbss = ~0ULL;
++        int mp = (IsMP ? 1 : 0) | (IsMPClient ? 2 : 0);
++        if (mp != lastmp)
++        {
++            Log(LogLevel::Debug, "[diag] MP state: IsMP=%d IsMPClient=%d (was %d/%d) USTimestamp=%llu NextSync=%llu AID=%d\n",
++                mp & 1, (mp >> 1) & 1, lastmp < 0 ? -1 : (lastmp & 1), lastmp < 0 ? -1 : ((lastmp >> 1) & 1),
++                (unsigned long long)USTimestamp, (unsigned long long)NextSync, IOPORT(W_AIDLow));
++            lastmp = mp;
++        }
++        if (ComStatus != lastcom)
++        {
++            if (diag::Allow(diag::RCom, 10, "ComStatus"))
++                Log(LogLevel::Debug, "[diag] ComStatus %u -> %u (IsMP=%d IsMPClient=%d TXCurSlot=%d)\n",
++                    lastcom, ComStatus, IsMP, IsMPClient, TXCurSlot);
++            lastcom = ComStatus;
++        }
++        u32 aid = IOPORT(W_AIDLow) | ((u32)IOPORT(W_AIDFull) << 16);
++        if (aid != lastaid)
++        {
++            Log(LogLevel::Debug, "[diag] AID: AIDLow=%d AIDFull=%04X\n", IOPORT(W_AIDLow), IOPORT(W_AIDFull));
++            lastaid = aid;
++        }
++        u64 bss = (u64)IOPORT(W_BSSID0) | ((u64)IOPORT(W_BSSID1) << 16) | ((u64)IOPORT(W_BSSID2) << 32);
++        if (bss != lastbss)
++        {
++            Log(LogLevel::Debug, "[diag] BSSID: %s (own MAC %s)\n", diag::Mac((u8*)&IOPORT(W_BSSID0)).S,
++                diag::Mac((u8*)&IOPORT(W_MACAddr0)).S);
++            lastbss = bss;
++        }
++    }
++
+     if (IsMPClient && (!ComStatus))
+     {
+         if (RXTimestamp && (USTimestamp >= RXTimestamp))

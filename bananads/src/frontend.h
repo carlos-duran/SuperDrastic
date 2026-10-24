@@ -30,6 +30,7 @@ void alsa_ui_load(Alsa* a, int id, const int16_t* pcm, int frames, int rate, int
 void alsa_ui_play(Alsa* a, int id);
 void alsa_stop(Alsa* a);
 void alsa_mute(Alsa* a, bool on);  // the game's sound faded out (fast-forward: sped-up sound is chopped noise), or back
+void alsa_duck(Alsa* a, float level);  // the game's sound at this level (0-1): lowered under the menu over a running game
 #endif
 
 }  // namespace bananads

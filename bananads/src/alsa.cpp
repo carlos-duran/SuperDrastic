@@ -32,6 +32,7 @@ struct Alsa {
     Emu* emu;
     std::atomic<bool> run{true};
     std::atomic<bool> mute{false};  // alsa_mute: the game's sound faded to silence (the menu's sounds still play)
+    std::atomic<float> duck{1.f};   // alsa_duck: the game's sound lowered to this (the menu over a running game)
     std::thread out, in;
     std::string out_dev, in_dev;
     unsigned latency_us;
@@ -263,9 +264,10 @@ static void out_thread(Alsa* a) {
                 st_min = st_max = skew; st_sum = st_back = 0;
             }
         }
-        // muted (fast-forward): faded over ~5 ms each way, so neither end clicks
-        const float target = a->mute.load(std::memory_order_relaxed) ? 0.f : 1.f;
-        if (gain != target || target == 0.f)
+        // muted (fast-forward): faded over ~5 ms each way, so neither end clicks; lowered (the menu over a running
+        // game) the same way
+        const float target = a->mute.load(std::memory_order_relaxed) ? 0.f : a->duck.load(std::memory_order_relaxed);
+        if (gain != target || target != 1.f)  // (held at a level under 1 every sample is scaled)
             for (int i = 0; i < n; i++) {
                 gain = target > gain ? std::min(target, gain + 1.f / 240) : std::max(target, gain - 1.f / 240);
                 buf[i * 2] = (int16_t)(buf[i * 2] * gain);
@@ -349,6 +351,13 @@ Alsa* alsa_start(Emu& emu, const Config& cfg) {
 void alsa_mute(Alsa* a, bool on) {
     if (!a || a->mute.exchange(on) == on) return;
     Log(LogLevel::Info, "[alsa] game sound %s\n", on ? "faded out (fast-forward)" : "back");
+}
+
+void alsa_duck(Alsa* a, float level) {
+    if (!a) return;
+    level = std::clamp(level, 0.f, 1.f);
+    if (a->duck.exchange(level) == level) return;
+    Log(LogLevel::Info, "[alsa] game sound at %d%%%s\n", (int)std::lround(level * 100), level < 1.f ? " (the menu is open)" : "");
 }
 
 void alsa_stop(Alsa* a) {

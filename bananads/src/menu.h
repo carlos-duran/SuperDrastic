@@ -1,6 +1,7 @@
 // menu.h: the in-game menu (menu.c: SuperDrastic's, in BananaOS's colours) and what the frontend gives it. The
-// frontend pauses the game and calls bmenu_run, which draws both panels and reads the input itself until the menu
-// closes; everything it needs from the emulator and the handheld goes through bmenu_host.
+// frontend pauses the game (or, in a local wireless game, keeps it running: bmenu_host's live) and calls bmenu_run,
+// which draws both panels and reads the input itself until the menu closes; everything it needs from the emulator and
+// the handheld goes through bmenu_host.
 #pragma once
 #include <stdint.h>
 
@@ -18,6 +19,31 @@ typedef struct {
 
 // the menu's own slots 1-8 are the emulator's savestate slots 1-8; slot 9 keeps the game from before a load (undo)
 enum { BM_UNDO_SLOT = 9 };
+
+/* the LAN multiplayer page (Quick settings > LAN multiplayer: wifi.local, melonDS's LAN), as the frontend reports it */
+enum { BM_LAN_OFF, BM_LAN_HOST, BM_LAN_JOIN, BM_LAN_AUTO, BM_LAN_MODES };   /* (the page shows Off, Auto, Host, Join) */
+/* Auto's steps: waiting for the game to turn its wifi on, looking for hosts, joining one, hosting, joined, the game
+ * online (Nintendo WFC: no local session), stopped by a problem (a UDP port taken: until the game's wifi goes off and
+ * on, or Off then Auto) */
+enum { BM_AUTO_WAIT, BM_AUTO_SEARCH, BM_AUTO_JOINING, BM_AUTO_HOST, BM_AUTO_JOINED, BM_AUTO_ONLINE, BM_AUTO_HELD };
+enum { BM_LAN_IDLE, BM_LAN_BUSY, BM_LAN_READY, BM_LAN_FAILED };  /* idle: off or looking for hosts; ready: hosting or joined */
+#define BM_LAN_MAX 16
+typedef struct {
+    int mode, state;      /* BM_LAN_* */
+    int max_players;      /* a host's session: how many, us included (2-16) */
+    char name[32];        /* our player name (firmware.nickname, Settings > Nintendo DS > DS name) */
+    char addr[48];        /* join: the host's address */
+    char msg[96];         /* failed: what went wrong */
+    char env[96];         /* "BANANADS_WIFI_LOCAL=host": set in the environment (bananads.env), it wins at each start */
+    int nplayers;         /* in the session (ready), us included */
+    struct { char name[32]; int host, me, ping; } players[BM_LAN_MAX];   /* ping in ms, -1 unknown */
+    int nhosts;           /* join, looking: the hosts on the network */
+    struct { char name[64]; char addr[48]; int players, max; } hosts[BM_LAN_MAX];
+    int phase;            /* auto: BM_AUTO_* */
+    int untagged;         /* auto, joined: the host doesn't say its game (desktop melonDS) */
+    int no_net;           /* no network (Wi-Fi off or not connected): nothing starts; the mode is kept */
+    int host_players;     /* Host's size (wifi.local_players, 2-16): a session Host or Auto starts */
+} bmenu_lan;
 
 typedef struct {
     void* ctx;
@@ -56,6 +82,21 @@ typedef struct {
     const char* (*cheat_name)(void* ctx, int i);
     int (*cheat_get)(void* ctx, int i);
     void (*cheat_set)(void* ctx, int i, int on);
+    // 1: a local wireless game is on (wifi.local, another handheld in it): Save, Load and Restart game are off, as a
+    // load or a restart would break it. Asked as the menu opens; unset: never
+    int (*mp_lock)(void* ctx);
+    // 1: the game keeps running behind the menu (a local wireless game), with no input from the player; Save, Load,
+    // Restart game and Cheats are off meanwhile, whatever mp_lock says. Asked as the menu opens and every 250 ms while
+    // it is open: 0 once the frontend has paused the game (the local game over), and the menu goes on as the paused
+    // one. Called on the menu's thread; unset: never
+    int (*live)(void* ctx);
+    // LAN multiplayer (Quick settings): lan_get fills st, 0 when this build has no LAN (no row). lan_set asks for a
+    // mode: BM_LAN_HOST with max_players, BM_LAN_JOIN with a host's address to join it or "" to look for hosts,
+    // BM_LAN_AUTO (a session it hosts has Host's size; max_players unused), BM_LAN_OFF; the mode (not the address) is
+    // kept for the next game. It returns at once: lan_get says when it is done (a join can take 5 s). Mode changes only
+    // outside a local wireless game (mp_lock, live), but for Off from Auto: the menu sees to it
+    int (*lan_get)(void* ctx, bmenu_lan* st);
+    void (*lan_set)(void* ctx, int mode, int max_players, const char* addr);
 } bmenu_host;
 
 void bmenu_init(const bmenu_host* host);  // once, before the first bmenu_run

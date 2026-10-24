@@ -55,7 +55,7 @@ cmake --build build-bananads -j
 ```
 
 Needs CMake 3.16+ and a C++17 compiler (libslirp comes with melonDS), and optionally SDL2 (`-DBANANADS_SDL=OFF` without),
-ALSA (`-DBANANADS_ALSA=OFF`) and libenet (`-DBANANADS_LAN=ON`). For the handhelds,
+ALSA (`-DBANANADS_ALSA=OFF`) and libenet (`-DBANANADS_LAN=ON`, local wireless over the network: [docs/LAN.md](docs/LAN.md)). For the handhelds,
 `-DCMAKE_TOOLCHAIN_FILE=bananads/cmake/aarch64-linux-gnu.cmake`; `-DBANANADS_MELONDS_DIR=<checkout>` builds
 against a local melonDS. Settings: [docs/SETTINGS.md](docs/SETTINGS.md).
 
