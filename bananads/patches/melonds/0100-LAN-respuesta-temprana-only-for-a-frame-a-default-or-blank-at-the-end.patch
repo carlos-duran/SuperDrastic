@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carlos Duran <15650777+carlos-duran@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 01:57:57 -0500
+Subject: [PATCH] LAN: respuesta-temprana only for a frame, a default or blank
+ reply at the reception's end
+
+With BANANADS_LAN_EARLY_REPLY=1, 0099 sent every reply at the CMD's arrival, the default and the blank too. What the
+reply is depends on the game's state at the end of the CMD's reception, not at its arrival: Mario Kart DS's lobby
+(the "Espera, por favor" before "Guardando") turns W_AIDLow 0 and 1 again around every CMD, so a blank sent at the
+arrival was a frame at the end in 2 of 3 replies (two handhelds over the direct link, 2026-10-29: early frame=18473
+default=402 blank=36762, at the end ok=20391 kind=35245; the host got blanks and the session failed before
+"Guardando").
+
+Now only a frame already in the reply slot, for our AID, goes out early; a default or blank reply is left to the end
+of the reception, which sends it as without the flag. "[diag] LAN early-reply" also counts those left ("left to the
+reception's end default= blank=") and an early frame whose end would have sent a default or blank ("early frames
+late as default= blank=").
+---
+ src/Wifi.cpp | 25 +++++++++++++++++--------
+ 1 file changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/src/Wifi.cpp b/src/Wifi.cpp
+index ac331f8..15227f2 100644
+--- a/src/Wifi.cpp
++++ b/src/Wifi.cpp
+@@ -120,6 +120,7 @@ static u64 TS;
+ static u8 Buf[12 + 0x2000];
+ // per window
+ static int NSent[4], NOK, NKind, NLen, NHdr, NSeq, NPay, NOrphan;
++static int NSkip[4], NLateAs[4];  // BananaDS 0100: not sent early (default, blank); an early frame's late kind
+ static s64 DMin, DMax, DSum; static int DN;
+ static int Offs[4], NOffs;
+ static u64 WinStart;
+@@ -129,13 +130,16 @@ static void Flush(bool force)
+     const u64 t = Platform::GetMSCount();
+     if (!WinStart) WinStart = t;
+     if (!force && t - WinStart < 1000) return;
+-    if (NSent[1] + NSent[2] + NSent[3] + NOrphan)
++    if (NSent[1] + NSent[2] + NSent[3] + NOrphan + NSkip[KDefault] + NSkip[KBlank])
+         Log(LogLevel::Info, "[diag] LAN early-reply: sent frame=%d default=%d blank=%d; at the reception's end ok=%d "
+-            "kind=%d len=%d hdr=%d seq=%d pay=%d orphan=%d; ts late-early us min=%lld mean=%.1f max=%lld; offs=%d,%d,%d,%d\n",
++            "kind=%d len=%d hdr=%d seq=%d pay=%d orphan=%d; ts late-early us min=%lld mean=%.1f max=%lld; offs=%d,%d,%d,%d; "
++            "left to the reception's end default=%d blank=%d; early frames late as default=%d blank=%d\n",
+             NSent[1], NSent[2], NSent[3], NOK, NKind, NLen, NHdr, NSeq, NPay, NOrphan,
+             (long long)(DN ? DMin : 0), DN ? (double)DSum / DN : 0.0, (long long)(DN ? DMax : 0),
+-            NOffs > 0 ? Offs[0] : -1, NOffs > 1 ? Offs[1] : -1, NOffs > 2 ? Offs[2] : -1, NOffs > 3 ? Offs[3] : -1);
++            NOffs > 0 ? Offs[0] : -1, NOffs > 1 ? Offs[1] : -1, NOffs > 2 ? Offs[2] : -1, NOffs > 3 ? Offs[3] : -1,
++            NSkip[KDefault], NSkip[KBlank], NLateAs[KDefault], NLateAs[KBlank]);
+     NSent[1] = NSent[2] = NSent[3] = NOK = NKind = NLen = NHdr = NSeq = NPay = NOrphan = 0;
++    NSkip[KDefault] = NSkip[KBlank] = NLateAs[KDefault] = NLateAs[KBlank] = 0;
+     DMin = DMax = DSum = 0; DN = 0; NOffs = 0;
+     WinStart = t;
+ }
+@@ -147,6 +151,13 @@ static void Sent(int kind, int len, u64 ts)
+     Flush(false);
+ }
+ 
++// BananaDS 0100: a default or blank reply isn't sent early; the end of the reception sends it as without the flag.
++// What the reply is depends on the game's state at that end, not at the CMD's arrival: Mario Kart DS's lobby (the
++// "Espera, por favor" before "Guardando") turns W_AIDLow 0 and 1 again around every CMD, so a blank sent at the
++// arrival was a frame at the end in 2 of 3 replies (2026-10-29 on two handhelds: the host got blanks, the session
++// failed). Only a frame already in the reply slot, for our AID, goes out early.
++static void Skipped(int kind) { NSkip[kind]++; Flush(false); }
++
+ // at the end of the reception: what would have been sent (nothing is)
+ static void Late(int kind, const u8* buf, int len, u64 ts)
+ {
+@@ -155,7 +166,7 @@ static void Late(int kind, const u8* buf, int len, u64 ts)
+     if (!DN || d < DMin) DMin = d;
+     if (!DN || d > DMax) DMax = d;
+     DSum += d; DN++;
+-    if (kind != Kind) NKind++;
++    if (kind != Kind) { NKind++; NLateAs[kind]++; }
+     else if (len != Len) NLen++;
+     else
+     {
+@@ -2144,15 +2155,13 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
+                         *(u16*)&b[0xC + 0x14] = 0x1000;
+                         *(u16*)&b[0xC + 0x16] = IOPORT(W_TXSeqNo) << 4;
+                         *(u32*)&b[0xC + 0x18] = 0;
+-                        Platform::MP_SendReply(b, 12 + 28, ts, IOPORT(W_AIDLow), NDS.UserData);
+-                        erep::Sent(erep::KDefault, 12 + 28, ts);
++                        erep::Skipped(erep::KDefault);  // (0100: sent at the reception's end, b unused)
+                     }
+                 }
+                 else
+                 {
+                     // not for us: the blank (FinishRX)
+-                    Platform::MP_SendReply(nullptr, 0, ts, 0, NDS.UserData);
+-                    erep::Sent(erep::KBlank, 0, ts);
++                    erep::Skipped(erep::KBlank);  // (0100: sent at the reception's end)
+                 }
+             }
+ 
+-- 
+2.47.3
+

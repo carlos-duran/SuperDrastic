@@ -138,4 +138,10 @@ own screens) ends its session and waits; with others in it, after 30 s off. A UD
   have sent is compared with what went out. "[diag] LAN early-reply", a second: what went out (`frame`, `default`,
   `blank`), then `ok` and the mismatches (`kind`, `len`, `hdr` (bytes 0-11), `seq`, `pay`, the first `offs`),
   `orphan` (a reception that never ended) and the late - early time stamps in us. A mismatch is never resent.
+- **0100** (LAN, respuesta-temprana): only a frame already in the reply slot, for our AID, goes out early; a default
+  or blank reply is left to the end of the reception, which sends it as without the flag. What the reply is depends
+  on the game's state at that end: Mario Kart DS's lobby ("Espera, por favor" before "Guardando") turns `W_AIDLow` 0
+  and 1 again around every CMD, and with 0099 alone 2 of 3 early blanks were frames at the end (two handhelds over
+  the direct link, 2026-10-29: the host got blanks, the session failed before "Guardando"). The diag line adds
+  `left to the reception's end default= blank=` and `early frames late as default= blank=`.
 - Their other "[diag]" traces log at the Debug level only (`log.level = 0`).
