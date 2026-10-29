@@ -111,4 +111,9 @@ own screens) ends its session and waits; with others in it, after 30 s off. A UD
 - **0095** (LAN): a child repeats its auth/association request every frame until the parent answers (1 s at most).
   Desktop melonDS 1.0/1.1 hosting a group sleeps between its beacons and drops a frame that came while it slept,
   so a single request reached it only by chance; a parent that stays awake answers before the first copy.
-- Their "[diag]" traces log at the Debug level only (`log.level = 0`).
+- **0096** (LAN, for testing): `BANANADS_LAN_TIMEOUT_MS` (1-100, in /data/banana/bananads.env) replaces the 25 ms
+  the host waits for its players' replies to each MP command, and a child for the host (unset: 25 ms, as before).
+  The value in use is logged at startup ("LAN: MP receive timeout"); with the variable set, the per-second
+  "[diag] LAN last" line comes at the Info level on both sides, with the waits (count, total, longest) and the
+  host's reply waits that timed out.
+- Their other "[diag]" traces log at the Debug level only (`log.level = 0`).
