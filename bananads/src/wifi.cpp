@@ -5,11 +5,16 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <dirent.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cerrno>
 #include <cstring>
@@ -371,6 +376,245 @@ void WfcDns::RecvCheck() noexcept {
         int fl2 = build_reply(frame, sizeof frame, it->second.mac, it->second.ip, it->second.port, buf, (int)n);
         pending_.erase(it);
         if (fl2) to_ds_(frame, fl2);
+    }
+}
+
+// ---- the direct link ------------------------------------------------------------------------------------
+extern "C" char** environ;
+
+static uint64_t mono_ms() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+DirectLink::DirectLink(std::string script, int channel) : script_(std::move(script)), channel_(channel) {
+    thr_ = std::thread([this] { worker(); });
+}
+
+DirectLink::~DirectLink() {
+    {
+        std::lock_guard<std::mutex> l(mu_);
+        quit_ = true;
+        q_.clear();
+    }
+    cv_.notify_all();
+    if (const pid_t p = child_.load()) kill(p, SIGTERM);  // (run() sees it end; the supervisor lives on)
+    if (thr_.joinable()) thr_.join();
+}
+
+bool DirectLink::usable(const std::string& script) {
+    struct stat sb;
+    return !script.empty() && stat(script.c_str(), &sb) == 0 && S_ISREG(sb.st_mode) && access(script.c_str(), R_OK) == 0;
+}
+
+void DirectLink::up(const std::string& role) {
+    {
+        std::lock_guard<std::mutex> l(mu_);
+        while (!q_.empty() && q_.back() != "down") q_.pop_back();  // (only the latest up counts)
+        q_.push_back(role == "host" ? "host" : "join");
+    }
+    cv_.notify_all();
+}
+
+void DirectLink::down() {
+    {
+        std::lock_guard<std::mutex> l(mu_);
+        q_.clear();
+        q_.push_back("down");
+        // an up still running (waiting for its cell, up to 35 s): stopped, so the down doesn't wait behind it; the
+        // script's supervisor it started is told by the down
+        if (busy_ && st_.state == State::Starting) {
+            drop_up_ = true;
+            if (const pid_t p = child_.load()) kill(p, SIGTERM);
+        }
+    }
+    cv_.notify_all();
+}
+
+bool DirectLink::down_wait(int timeout_ms) {
+    down();
+    std::unique_lock<std::mutex> l(mu_);
+    return cv_.wait_for(l, std::chrono::milliseconds(timeout_ms), [this] { return q_.empty() && !busy_; });
+}
+
+DirectLink::Status DirectLink::status() const {
+    std::lock_guard<std::mutex> l(mu_);
+    return st_;
+}
+
+void DirectLink::set(const Status& s) {
+    {
+        std::lock_guard<std::mutex> l(mu_);
+        st_ = s;
+    }
+    gen_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool DirectLink::parse_ok(const std::string& line, Status& st) {
+    if (line.rfind("ok ", 0) != 0) return false;
+    size_t i = 3;
+    while (i < line.size()) {
+        const size_t e = line.find(' ', i);
+        const std::string w = line.substr(i, e == std::string::npos ? std::string::npos : e - i);
+        const size_t eq = w.find('=');
+        if (eq != std::string::npos) {
+            const std::string k = w.substr(0, eq), v = w.substr(eq + 1);
+            if (k == "role") st.role = v;
+            else if (k == "ip") st.ip = v;
+            else if (k == "freq") st.freq = atoi(v.c_str());
+            else if (k == "state" && v != "up") return false;
+        }
+        if (e == std::string::npos) break;
+        i = e + 1;
+    }
+    return !st.ip.empty();
+}
+
+int DirectLink::run(const std::string& script, const std::vector<std::string>& args, int timeout_ms,
+                    std::vector<std::string>& out, std::atomic<pid_t>* running) {
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) return -1;
+    std::vector<std::string> av{"sh", script};
+    av.insert(av.end(), args.begin(), args.end());
+    std::vector<char*> argv;
+    for (std::string& a : av) argv.push_back(a.data());
+    argv.push_back(nullptr);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34))
+    // nothing of BananaDS's own (the panels' DRM files, sockets) in the script or the supervisor it leaves running
+    posix_spawn_file_actions_addclosefrom_np(&fa, 3);
+#endif
+    posix_spawnattr_t at;
+    posix_spawnattr_init(&at);
+    sigset_t none, dfl;
+    sigemptyset(&none);
+    sigemptyset(&dfl);
+    sigaddset(&dfl, SIGPIPE);  // (BananaDS ignores it; the script's pipes shouldn't)
+    sigaddset(&dfl, SIGCHLD);
+    posix_spawnattr_setsigmask(&at, &none);
+    posix_spawnattr_setsigdefault(&at, &dfl);
+    posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+    pid_t pid = 0;
+    const int e = posix_spawn(&pid, "/bin/sh", &fa, &at, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&at);
+    close(fds[1]);
+    if (e != 0) {
+        close(fds[0]);
+        return -1;
+    }
+    if (running) running->store(pid);
+    const uint64_t t0 = mono_ms();
+    std::string buf;
+    bool timed_out = false;
+    for (;;) {
+        const int64_t left = (int64_t)timeout_ms - (int64_t)(mono_ms() - t0);
+        if (left <= 0) {
+            timed_out = true;
+            break;
+        }
+        pollfd p{fds[0], POLLIN, 0};
+        const int r = poll(&p, 1, (int)std::min<int64_t>(left, 500));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) continue;
+        char b[512];
+        const ssize_t n = read(fds[0], b, sizeof b);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;  // EOF: the script (and all that kept its output) has ended
+        buf.append(b, (size_t)n);
+    }
+    close(fds[0]);
+    if (timed_out) kill(pid, SIGKILL);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (running) running->store(0);
+    size_t i = 0;
+    while (i < buf.size()) {
+        const size_t j = buf.find('\n', i);
+        const std::string l = buf.substr(i, j == std::string::npos ? std::string::npos : j - i);
+        if (!l.empty()) out.push_back(l);
+        if (j == std::string::npos) break;
+        i = j + 1;
+    }
+    if (timed_out) return -2;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+void DirectLink::worker() {
+    const std::string owner = std::to_string(getpid());
+    for (;;) {
+        std::string cmd;
+        {
+            std::unique_lock<std::mutex> l(mu_);
+            cv_.wait(l, [this] { return quit_ || !q_.empty(); });
+            if (quit_) break;
+            cmd = q_.front();
+            q_.pop_front();
+            busy_ = true;
+            drop_up_ = false;
+        }
+        Status s = status();
+        std::vector<std::string> out;
+        if (cmd == "down") {
+            if (s.state == State::Down) {  // (nothing of ours up: still asked, in case one was left behind)
+                run(script_, {"down", "--nowait"}, 5000, out, &child_);
+            } else {
+                s.state = State::Stopping;
+                set(s);
+                const uint64_t t0 = mono_ms();
+                const int rc = run(script_, {"down"}, 20000, out, &child_);
+                Log(rc == 0 ? LogLevel::Info : LogLevel::Warn, "[wifi] direct link: down (%.1f s): %s\n",
+                    (mono_ms() - t0) / 1000.0, out.empty() ? "(no answer)" : out.back().c_str());
+            }
+            Status d;
+            d.msg = s.state == State::Failed ? s.msg : "";
+            set(d);
+        } else {
+            Status n;
+            n.state = State::Starting;
+            n.role = cmd;
+            n.ip = s.state == State::Up ? s.ip : "";
+            n.freq = s.freq;
+            set(n);
+            std::vector<std::string> args{"up", cmd, "--owner", owner};
+            if (channel_ >= 1 && channel_ <= 11) {
+                args.push_back("--channel");
+                args.push_back(std::to_string(channel_));
+            }
+            const uint64_t t0 = mono_ms();
+            const int rc = run(script_, args, 60000, out, &child_);
+            for (const std::string& l : out) Log(LogLevel::Debug, "[wifi] direct link: %s\n", l.c_str());
+            Status r;
+            r.role = cmd;
+            const std::string last = out.empty() ? "" : out.back();
+            if (drop_up_.load()) {
+                Log(LogLevel::Info, "[wifi] direct link: up %s stopped by a down\n", cmd.c_str());
+            } else if (rc == 0 && parse_ok(last, r)) {
+                r.state = State::Up;
+                r.role = cmd;
+                Log(LogLevel::Info, "[wifi] direct link: up as %s at %s, %d MHz (%.1f s)\n", cmd.c_str(), r.ip.c_str(),
+                    r.freq, (mono_ms() - t0) / 1000.0);
+                set(r);
+            } else {
+                r.state = State::Failed;
+                r.msg = rc == -1 ? "couldn't run " + script_
+                      : rc == -2 ? "no answer from the link script in 60 s"
+                      : last.rfind("error ", 0) == 0 ? last.substr(6) : last.empty() ? "the link script failed" : last;
+                Log(LogLevel::Error, "[wifi] direct link: up as %s failed (%.1f s): %s\n", cmd.c_str(),
+                    (mono_ms() - t0) / 1000.0, r.msg.c_str());
+                set(r);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> l(mu_);
+            busy_ = false;
+        }
+        cv_.notify_all();
     }
 }
 

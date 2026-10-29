@@ -44,6 +44,8 @@ extern int g_emu_core;
 extern int g_emu_share;
 void sched_off_emu_core();
 
+class DirectLink;  // wifi.h
+
 class Emu {
 public:
     explicit Emu(const Config& cfg);
@@ -153,10 +155,19 @@ public:
         AutoPhase phase = AutoPhase::Wait;  // Auto: where it is
         bool host_untagged = false;      // Auto, joined: a host that doesn't say its game (desktop melonDS)
         bool no_net = false;             // no network (Wi-Fi off or not connected): the mode waits for one
+        // Connection (wifi.local_link): router (the Wi-Fi network, as before) or direct (DirectLink, wifi.h: the
+        // consoles on a cell of their own, no router; this one off its Wi-Fi network meanwhile)
+        bool link_avail = false;         // the link script is there (link.script, BananaOS's wifi-link)
+        bool link_direct = false;        // Connection: Direct
+        int link_state = 0;              // DirectLink::State (0 down, 1 starting, 2 up, 3 stopping, 4 failed)
+        std::string link_ip;             // ours on the link
+        int link_freq = 0;               // MHz
     };
     LanStatus lan_status() const;             // any thread: a copy
     // max_players: Host's (0: as it was); Auto hosts with Host's. Requests are carried out in order
     void lan_request(LanMode mode, const std::string& addr = "", int max_players = 0);  // any thread
+    // Connection: Direct (true) or Router; only with the mode Off (otherwise ignored). Any thread
+    void lan_link_request(bool direct);
     std::string state_path(int slot) const;
 
     Mic& mic() { return mic_; }
@@ -225,6 +236,11 @@ private:
     void lan_tag_update();                            // the beacon's game tag and Status (a host of any mode)
     void lan_net_check(bool now);                     // a usable network, every 1 s (same); its changes
     bool lan_net_wait(LanMode mode, const std::string& addr, int max_players);  // no network: the mode waits
+    // the direct link (emulator thread, net_mu_ held)
+    void lan_link_tick();                             // its status changed (DirectLink::generation)
+    void lan_link_set(bool direct);                   // Connection changed (the mode Off)
+    void lan_link_lost(const std::string& why);       // it failed or went: the mode Off, the reason shown
+    bool lan_link_addr() const;                       // our link address still on an interface
 #endif
 
     std::atomic<double> skew_req_{1.0};
@@ -248,9 +264,12 @@ private:
     std::mutex net_mu_;  // service_net() against the menu thread's save_state/load_state/restart (LAN Begin/End)
     mutable std::mutex lan_mu_;   // lan_st_ and lan_req_ (the menu's thread and the emulator's)
     LanStatus lan_st_;
-    struct LanReq { LanMode mode; std::string addr; int max_players; };
+    struct LanReq { LanMode mode; std::string addr; int max_players; int link = -1; };  // link >= 0: Connection
     std::vector<LanReq> lan_req_;            // the menu's requests, not yet carried out (in order)
     void lan_apply_one(const LanReq& r);
+#ifdef BANANADS_LAN
+    bool lan_link_ready(const LanReq& r);   // direct: the link up for r's role; false: asked for, r waits for it
+#endif
     std::atomic<bool> lan_pending_{false};
     uint64_t lan_refresh_us_ = 0;
     size_t lan_hosts_seen_ = 0;              // (the log: hosts found)
@@ -262,6 +281,14 @@ private:
     std::vector<std::pair<long, bool>> auto_test_wifi_;  // wifi.local_auto_test_wifi: the game's wifi by frame (tests)
     std::vector<std::pair<long, LanMode>> lan_test_modes_;  // wifi.local_test_mode: the Mode row by frame (tests)
     bool lan_st_built_ = false;               // (setup_local ran: the network check runs)
+    // the direct link (wifi.local_link = direct)
+    std::unique_ptr<DirectLink> link_;        // the link script's runner (null: no script, no Connection row)
+    bool link_direct_ = false;                // Connection: Direct
+    bool link_used_ = false;                  // asked up once: down at the quit
+    bool link_wait_ = false;                  // link_req_ waits for the link
+    LanReq link_req_{LanMode::Off, "", 0};
+    uint32_t link_gen_ = 0;                   // DirectLink::generation last seen
+    int link_gone_ = 0;                       // checks in a row with the link up but our address gone
     bool net_ok_ = true;                      // a network interface up, connected, with an IPv4 address
     uint64_t net_check_us_ = 0;
     long auto_wifi_off_frames_ = 0;           // frames run in a row with the game's wifi off

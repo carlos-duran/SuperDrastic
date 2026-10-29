@@ -16,11 +16,17 @@
 // servers tell players apart by MAC, and DraStic's firmware gives every device 00:01:02:03:04:05.
 #pragma once
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
+#include <sys/types.h>
 
 #include "NetDriver.h"
 #include "Platform.h"
@@ -91,6 +97,51 @@ private:
     int sock_ = -1;
     std::map<uint16_t, Pending> pending_;  // by DNS id
     uint16_t ipid_ = 1;
+};
+
+// ---- the direct link (wifi.local_link = direct: LAN multiplayer without a router) ---------------------------
+// BananaOS's /usr/libexec/banana/wifi-link (link.script, BANANADS_LINK_SCRIPT, to test another one) puts this
+// handheld and the others on an IBSS cell of their own, with addresses in 10.42.0.0/16, and puts the home Wi-Fi
+// back when it comes down; its own supervisor also does that when BananaDS is gone (--owner, a crash) or stopped (a
+// sleep). The commands run on a thread of this class, never on the emulator's: "up host|join" takes 5-25 s.
+// The script is run with /bin/sh (a copy on the card's exFAT has no exec bit), its other files closed, and its
+// last "ok ..."/"error ..." line read.
+class DirectLink {
+public:
+    enum class State { Down, Starting, Up, Stopping, Failed };
+    struct Status {
+        State state = State::Down;
+        std::string role, ip, msg;  // role "host" or "join"; ip ours on the link; msg: a failure's reason
+        int freq = 0;               // MHz
+    };
+    explicit DirectLink(std::string script, int channel = 0);  // channel 1-11, 0: the script's own (1)
+    ~DirectLink();  // a command still running is stopped (the script's supervisor keeps or restores the link)
+    static bool usable(const std::string& script);  // a readable file
+    const std::string& script() const { return script_; }
+    void up(const std::string& role);  // queued; an up already queued is replaced
+    void down();                       // queued; an up running or queued is dropped (its supervisor told by down)
+    bool down_wait(int timeout_ms);    // down, and wait for it (the quit): false if it didn't end in time
+    Status status() const;
+    uint32_t generation() const { return gen_.load(std::memory_order_acquire); }  // +1 at every status change
+    // run "sh script args...": its output's lines in out; its exit status (-1: couldn't run, -2: timed out, killed)
+    static int run(const std::string& script, const std::vector<std::string>& args, int timeout_ms,
+                   std::vector<std::string>& out, std::atomic<pid_t>* running = nullptr);
+    static bool parse_ok(const std::string& line, Status& st);  // "ok state=up role=host ip=... freq=..."
+
+private:
+    void worker();
+    void set(const Status& s);
+    std::string script_;
+    int channel_ = 0;
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<std::string> q_;  // "host", "join" or "down"
+    Status st_;
+    bool quit_ = false, busy_ = false;
+    std::atomic<uint32_t> gen_{0};
+    std::atomic<pid_t> child_{0};
+    std::atomic<bool> drop_up_{false};  // a down came while an up runs: its result doesn't count
+    std::thread thr_;
 };
 
 }  // namespace bananads
