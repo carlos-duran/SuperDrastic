@@ -40,6 +40,7 @@
 #include "GPU_Banana.h"
 #endif
 #include "NDS.h"
+#include "EmuDiag.h"
 #include "NDSCart.h"
 #include "Net.h"
 #include "Net_Slirp.h"
@@ -2007,6 +2008,7 @@ bool Emu::load_rom(const std::string& path) {
         check_secure_area();
     }
     setup_slice();
+    diag_emu_setup();
     // core.fast_gxdma / core.fast_spu: exact shortcuts in melonDS's DMA and SPU (patches/melonds/0004), off by
     // default until measured on the handheld
     nds_->FastGXDMA = cfg_.flag("core.fast_gxdma", false);
@@ -2200,6 +2202,96 @@ bool Emu::load_rom(const std::string& path) {
 // are interleaved again (patches/melonds/0003). 64 is melonDS's. Longer is faster and coarser: each CPU sees the
 // other's writes up to a slice late. auto (or any core.slice_idle) is adaptive: core.slice_idle cycles while
 // neither CPU has touched the IPC registers or WRAMCNT for core.slice_hold cycles, core.slice (64 for auto) near them.
+// diag.emu (BANANADS_DIAG_EMU=1, melonDS patch 0401): once a second, RunFrame's time per frame split into the ARM9,
+// the ARM7 (with its timers), the 3D side (the geometry engine, the renderer's calls at VBlank and line 215, and
+// inside those the wait for Gengis's render threads, with its worst frame), the 2D side (the rest of the LCD
+// events), the SPU (its Mix events, BufferAudio), the LAN's MP waits, and the rest (the other events: Wifi, timers,
+// DMA, the slice loop itself); the CPU's temperature, clock and thermal cap from sysfs (pread, three files).
+// The CPUs and the geometry engine are sampled one slice in emudiag::SampleN: the shares, not exact times.
+void Emu::diag_emu_setup() {
+    diag_emu_ = cfg_.num("diag.emu", 0) != 0;
+    melonDS::emudiag::On = diag_emu_;
+    if (!diag_emu_) return;
+    de_freq_ = melonDS::emudiag::Freq();
+    if (de_temp_fd_ < 0) de_temp_fd_ = open("/sys/class/thermal/thermal_zone0/temp", O_RDONLY | O_CLOEXEC);
+    if (de_mhz_fd_ < 0) de_mhz_fd_ = open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", O_RDONLY | O_CLOEXEC);
+    if (de_cool_fd_ < 0)
+        if (DIR* d = opendir("/sys/class/thermal")) {
+            while (dirent* e = readdir(d)) {
+                if (strncmp(e->d_name, "cooling_device", 14)) continue;
+                const std::string c = std::string("/sys/class/thermal/") + e->d_name;
+                char t[32] = {};
+                const int fd = open((c + "/type").c_str(), O_RDONLY | O_CLOEXEC);
+                if (fd >= 0) { (void)!read(fd, t, sizeof t - 1); close(fd); }
+                if (!strncmp(t, "cpufreq-cpu", 11)) { de_cool_fd_ = open((c + "/cur_state").c_str(), O_RDONLY | O_CLOEXEC); break; }
+            }
+            closedir(d);
+        }
+    de_start_ = 0;
+    {  // a timer read's cost (the diag's own: reads a frame times this, on the line)
+        constexpr int N = 200000;
+        uint64_t x = 0;
+        const uint64_t t0 = melonDS::emudiag::Now();
+        for (int i = 0; i < N; i++) x += melonDS::emudiag::Now();
+        const uint64_t t1 = melonDS::emudiag::Now();
+        asm volatile("" : : "r"(x));
+        de_read_ns_ = (double)(t1 - t0) * 1e9 / (double)de_freq_ / N;
+    }
+    Log(LogLevel::Info, "[diag] EMU on: timer %llu Hz, %.1f ns a read, CPUs sampled 1 slice in %u; temp %s, clock %s, cap %s\n",
+        (unsigned long long)de_freq_, de_read_ns_, melonDS::emudiag::SampleN, de_temp_fd_ >= 0 ? "yes" : "no",
+        de_mhz_fd_ >= 0 ? "yes" : "no", de_cool_fd_ >= 0 ? "yes" : "no");
+}
+
+static long diag_read_num(int fd) {
+    if (fd < 0) return -1;
+    char b[32];
+    const ssize_t n = pread(fd, b, sizeof b - 1, 0);
+    if (n <= 0) return -1;
+    b[n] = 0;
+    return strtol(b, nullptr, 10);
+}
+
+void Emu::diag_emu_frame(uint64_t ticks) {
+    namespace ed = melonDS::emudiag;
+    const uint64_t now = ed::Now();
+    if (!de_start_) {  // the first frame starts the window, the accumulators from zero
+        de_start_ = now;
+        for (auto& t : ed::T) t = 0;
+        ed::FrameWait = 0;
+        ed::LANWaitUS = 0;
+        ed::Reads = 0;
+        return;
+    }
+    de_frames_++;
+    ed::Reads += 2;
+    de_rf_ += ticks;
+    if (ticks > de_rfmax_) de_rfmax_ = ticks;
+    if (ed::FrameWait > de_wmax_) de_wmax_ = ed::FrameWait;
+    ed::FrameWait = 0;
+    if (now - de_start_ < de_freq_) return;
+    const double k = 1000.0 / (double)de_freq_ / (double)de_frames_, ms = 1000.0 / (double)de_freq_;
+    const double sn = ed::SampleN;
+    const double arm9 = ed::T[ed::ARM9] * sn * k, arm7 = ed::T[ed::ARM7] * sn * k, geom = ed::T[ed::Geom] * sn * k;
+    const double r3d = ed::T[ed::R3D] * k, wait = ed::T[ed::R3DWait] * k;
+    const double d2 = (ed::T[ed::LCD] > ed::T[ed::R3D] ? ed::T[ed::LCD] - ed::T[ed::R3D] : 0) * k;
+    const double spu = ed::T[ed::SPU] * k, lan = ed::LANWaitUS / 1000.0 / (double)de_frames_;
+    const double rf = de_rf_ * k;
+    const double rest = rf - (arm9 + arm7 + geom + r3d + d2 + spu + lan);
+    const long mc = diag_read_num(de_temp_fd_), khz = diag_read_num(de_mhz_fd_), cool = diag_read_num(de_cool_fd_);
+    Log(LogLevel::Info,
+        "[diag] EMU %ld frames in %.0f ms: frame %.2f ms (max %.2f) = arm9 %.2f arm7 %.2f 3d %.2f (geom %.2f render %.2f, "
+        "of it wait %.2f, max %.2f) 2d %.2f spu %.2f lan-wait %.2f rest %.2f | %.1f C %ld MHz cap %ld | diag %.0f reads %.3f ms\n",
+        de_frames_, (now - de_start_) * ms, rf, de_rfmax_ * ms, arm9, arm7, geom + r3d, geom, r3d, wait,
+        de_wmax_ * ms, d2, spu, lan, rest, mc / 1000.0, khz / 1000, cool, ed::Reads / (double)de_frames_,
+        ed::Reads * de_read_ns_ / 1e6 / (double)de_frames_);
+    ed::Reads = 0;
+    for (auto& t : ed::T) t = 0;
+    ed::LANWaitUS = 0;
+    de_start_ = now;
+    de_frames_ = 0;
+    de_rf_ = de_rfmax_ = de_wmax_ = 0;
+}
+
 void Emu::setup_slice() {
     // (64, melonDS's, by default: auto was the default at render.scale=2 (HeartGold at 1104 MHz 60.2 -> 64.2 fps),
     // but Golden Sun: Dark Dawn's 3D field was never drawn with it: the game's own timing goes wrong (BananaOS 0.4.0))
@@ -2287,7 +2379,9 @@ void Emu::run_frame() {
     // diag-respuesta (BANANADS_LAN_TIMEOUT_MS set): the frame's RunFrame time, LAN waits inside it included
     const auto rf0 = local_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 #endif
+    const uint64_t de0 = diag_emu_ ? melonDS::emudiag::Now() : 0;
     nds_->RunFrame();
+    if (diag_emu_) diag_emu_frame(melonDS::emudiag::Now() - de0);
 #ifdef BANANADS_LAN
     if (local_)
         melonDS::LANDiagFrame((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(

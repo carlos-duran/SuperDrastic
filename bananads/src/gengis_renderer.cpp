@@ -3,6 +3,7 @@
 #include <sys/resource.h>
 #include "gengis_renderer.h"
 #include "emu.h"
+#include "EmuDiag.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -16,6 +17,19 @@
 using namespace melonDS;
 
 namespace bananads {
+
+// diag.emu (melonDS patch 0401): the emulator's thread's wait for the render threads, at the frame's start (RenderFrame)
+// and at VBlank (FinishRendering); the frontend logs the second's total and its worst frame
+struct DiagWait {
+    uint64_t T0 = melonDS::emudiag::On ? melonDS::emudiag::Now() : 0;
+    ~DiagWait() {
+        if (!T0) return;
+        const uint64_t w = melonDS::emudiag::Now() - T0;
+        melonDS::emudiag::T[melonDS::emudiag::R3DWait] += w;
+        melonDS::emudiag::FrameWait += w;
+        melonDS::emudiag::Reads += 2;
+    }
+};
 
 static inline uint64_t ThreadNs() {
     timespec t;
@@ -655,7 +669,10 @@ void GengisRenderer3D::WaitAll() {
 void GengisRenderer3D::RenderFrame() {
     if (Stats) StFrames++;
     const uint64_t w0 = Stats ? MonoNs() : 0;
-    WaitAll();  // the last frame's bins read VRAM and the polygons: done before either changes
+    {
+        DiagWait dw;
+        WaitAll();  // the last frame's bins read VRAM and the polygons: done before either changes
+    }
     if (Stats) StWaitNs += MonoNs() - w0;
     if (Crc && Gen && Out) {
         // render.gengis_crc: the finished frame's 3D layer (all its rows) as a CRC-32C, folded per 60 rendered frames
@@ -738,6 +755,7 @@ void GengisRenderer3D::RenderFrame() {
 // render.gengis_vbwait=0 (default at 3x and 4x) waits here for the conversion alone (doing it when no render thread
 // has started it), and the bins may run on until the next frame's start at line 215 (or the 2D thread's row waits)
 void GengisRenderer3D::FinishRendering() {
+    DiagWait dw;
     if (!VbConvOnly) { WaitAll(); return; }
     while (Converted.load(std::memory_order_acquire) != 2) {
         if (Converted.load(std::memory_order_acquire) == 0 && RenderOne(true)) continue;   // (converts, then draws one)

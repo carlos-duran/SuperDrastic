@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carlos Duran <15650777+carlos-duran@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 02:21:42 -0500
+Subject: [PATCH] NDS: diag-emu, where a frame's emulation time goes
+ (BANANADS_DIAG_EMU)
+
+For finding what keeps a Mario Kart DS battle over a direct link at 52-59 fps
+(the emulation itself, ~15-16.5 ms a frame on both consoles). Accumulators the
+frontend reads once per frame and logs once per second ("[diag] EMU"), in
+src/EmuDiag.h (inline variables: core and net-utils share them):
+
+- ARM9, ARM7 (with its timers) and the geometry engine (GPU3D::Run): one
+  RunSlicesJIT slice in 8 timed, the frontend scales them by 8;
+- the LCD events (the 2D side of a scanline: GPU2D's registers, its draw or the
+  2D thread's hand-off, the sprites, the DMAs they start) and, inside them, the
+  3D renderer's calls (Start3DRendering, Finish3DRendering, GPU3D::VBlank,
+  Restart3DRendering): every time;
+- the SPU's Mix events and RunFrame's BufferAudio: every time;
+- the LAN's MP waits (NoteWait, inside the Wifi events), in microseconds.
+
+The CPU's generic timer (cntvct_el0, what clock_gettime reads on arm64,
+without the call). Off (the default): one load and branch per slice and per
+event.
+---
+ src/EmuDiag.h   | 64 +++++++++++++++++++++++++++++++++++++++++++++++++
+ src/GPU.cpp     | 13 ++++++++--
+ src/NDS.cpp     | 38 +++++++++++++++++++++++++++--
+ src/net/LAN.cpp |  2 ++
+ 4 files changed, 113 insertions(+), 4 deletions(-)
+ create mode 100644 src/EmuDiag.h
+
+diff --git a/src/EmuDiag.h b/src/EmuDiag.h
+new file mode 100644
+index 0000000..87619dd
+--- /dev/null
++++ b/src/EmuDiag.h
+@@ -0,0 +1,64 @@
++// BananaDS diag-emu (BANANADS_DIAG_EMU=1, patch 0401): where a frame's emulation time goes, for the frontend's
++// per-second "[diag] EMU" line. Ticks of the CPU's generic timer (cntvct_el0, the counter clock_gettime reads on
++// arm64, without the vDSO call); the CPUs' and the geometry engine's time sampled one slice in SampleN, the LCD
++// and SPU events and the 3D renderer's calls timed every time. Off: one load and branch per slice and per event.
++#pragma once
++
++#include <stdint.h>
++#include <time.h>
++
++namespace melonDS::emudiag
++{
++
++enum Bucket { ARM9, ARM7, Geom, LCD, R3D, R3DWait, SPU, NBuckets };
++
++constexpr uint32_t SampleN = 8;  // a power of two
++
++inline bool On = false;
++inline uint32_t Sample = 0;
++inline uint64_t T[NBuckets] {};
++inline uint64_t FrameWait = 0;  // the 3D wait in the frame so far (the frontend takes its max per second)
++inline uint64_t LANWaitUS = 0;
++inline uint64_t Reads = 0;      // timer reads (the frontend logs them per frame, with their cost)  // LAN: the MP waits (inside the Wifi events), microseconds
++
++[[gnu::always_inline]] inline uint64_t Now()
++{
++#if defined(__aarch64__)
++    uint64_t v;
++    asm volatile("mrs %0, cntvct_el0" : "=r"(v));
++    return v;
++#else
++    timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
++#endif
++}
++
++// ticks per second
++inline uint64_t Freq()
++{
++#if defined(__aarch64__)
++    uint64_t f;
++    asm volatile("mrs %0, cntfrq_el0" : "=r"(f));
++    return f ? f : 1;
++#else
++    return 1000000000u;
++#endif
++}
++
++// a sampled slice: true one slice in SampleN while on
++[[gnu::always_inline]] inline bool SampleSlice()
++{
++    return On && (++Sample & (SampleN - 1)) == 0;
++}
++
++struct Scope
++{
++    uint64_t T0;
++    Bucket B;
++    bool Live;
++    [[gnu::always_inline]] Scope(Bucket b) : T0(On ? Now() : 0), B(b), Live(On) {}
++    [[gnu::always_inline]] ~Scope() { if (Live) { T[B] += Now() - T0; Reads += 2; } }
++};
++
++}
+diff --git a/src/GPU.cpp b/src/GPU.cpp
+index d534a63..79aed30 100644
+--- a/src/GPU.cpp
++++ b/src/GPU.cpp
+@@ -19,6 +19,7 @@
+ #include <string.h>
+ #include "NDS.h"
+ #include "GPU.h"
++#include "EmuDiag.h"
+ 
+ #include "ARMJIT.h"
+ 
+@@ -1171,6 +1172,7 @@ void GPU::StartHBlank(u32 line) noexcept
+     }
+     else if (VCount == 215)
+     {
++        emudiag::Scope d(emudiag::R3D);
+         Rend->Start3DRendering();
+     }
+     else if (VCount == 262)
+@@ -1199,6 +1201,7 @@ void GPU::FinishFrame(u32 lines) noexcept
+ 
+     if (GPU3D.AbortFrame)
+     {
++        emudiag::Scope d(emudiag::R3D);
+         Rend->Restart3DRendering();
+         GPU3D.AbortFrame = false;
+     }
+@@ -1296,7 +1299,10 @@ void GPU::StartScanline(u32 line) noexcept
+         // texture memory anyway and only update it before the start
+         // of the next frame.
+         // So we can give the rasteriser a bit more headroom
+-        Rend->Finish3DRendering();
++        {
++            emudiag::Scope d(emudiag::R3D);
++            Rend->Finish3DRendering();
++        }
+ 
+         DispStat[0] |= (1<<0);
+         DispStat[1] |= (1<<0);
+@@ -1306,7 +1312,10 @@ void GPU::StartScanline(u32 line) noexcept
+         NDS.CheckDMAs(0, 0x01);
+         NDS.CheckDMAs(1, 0x11);
+ 
+-        GPU3D.VBlank();
++        {
++            emudiag::Scope d(emudiag::R3D);
++            GPU3D.VBlank();
++        }
+ 
+         Rend->VBlank();
+ 
+diff --git a/src/NDS.cpp b/src/NDS.cpp
+index af2b57e..dc97f2d 100644
+--- a/src/NDS.cpp
++++ b/src/NDS.cpp
+@@ -21,6 +21,7 @@
+ #include <string.h>
+ #include <inttypes.h>
+ #include "NDS.h"
++#include "EmuDiag.h"
+ #include "ARMJIT_Stats.h"
+ #include "ARM.h"
+ #include "NDSCart.h"
+@@ -967,7 +968,16 @@ u64 NDS::NextTarget()
+ 
+             SCHED(sb, SchedNext) = next;
+             EventFunc func = evt.Funcs[evt.FuncID];
+-            func(evt.That, evt.Param);
++            if (emudiag::On && (i == Event_LCD || i == Event_SPU)) [[unlikely]]
++            {
++                // diag-emu: the LCD (2D, and the 3D renderer's calls, R3D, inside it) and SPU events
++                const u64 t0 = emudiag::Now();
++                func(evt.That, evt.Param);
++                emudiag::T[i == Event_LCD ? emudiag::LCD : emudiag::SPU] += emudiag::Now() - t0;
++                emudiag::Reads += 2;
++            }
++            else
++                func(evt.That, evt.Param);
+             next = SCHED(sb, SchedNext);
+             live = SCHED(sb, SchedListMask);
+         }
+@@ -1235,7 +1245,10 @@ u32 NDS::RunFrame()
+     }
+ 
+     // Ensure the last audio samples produced for this frame are available to the frontend immediately
+-    SPU.BufferAudio();
++    {
++        emudiag::Scope d(emudiag::SPU);
++        SPU.BufferAudio();
++    }
+ 
+     // In the context of TASes, frame count is traditionally the primary measure of emulated time,
+     // so it needs to be tracked even if NDS is powered off.
+@@ -1684,6 +1697,10 @@ void NDS::RunSlicesJIT()
+             }
+         }
+ 
++        // diag-emu: one slice in SampleN timed (the ARM9, the geometry engine, the ARM7 with the timers)
++        const bool dsamp = emudiag::SampleSlice();
++        u64 dt0 = dsamp ? emudiag::Now() : 0;
++
+         // NextTarget(), FastSched
+         const s32 sliceShort = SCHED(sb, SliceShort), sliceIdle = SCHED(sb, SliceIdle);
+         const u64 max = sys + (sys < SCHED(sb, SliceNearIPCUntil) ? sliceShort : sliceIdle);
+@@ -1716,6 +1733,13 @@ void NDS::RunSlicesJIT()
+             arm9.Execute<CPUExecuteMode::JIT>();
+ 
+         target = ARM9Timestamp >> ARM9ClockShift;
++        if (dsamp) [[unlikely]]
++        {
++            const u64 t = emudiag::Now();
++            emudiag::T[emudiag::ARM9] += t - dt0;
++            dt0 = t;
++            emudiag::Reads += 3;
++        }
+ 
+         // GPU3D::Run's early-out (the same condition, its cheapest part first)
+         const bool gpuIdle = (gpu3d.CmdPIPE.IsEmpty() && !(gpu3d.GXStat & (1<<27))) || !gpu3d.GeometryEnabled ||
+@@ -1757,7 +1781,15 @@ void NDS::RunSlicesJIT()
+                 gpu3d.Timestamp = target;
+             else
+             {
++                const u64 g0 = dsamp ? emudiag::Now() : 0;
+                 gpu3d.Run();
++                if (dsamp) [[unlikely]]
++                {
++                    const u64 g = emudiag::Now() - g0;
++                    emudiag::T[emudiag::Geom] += g;
++                    dt0 += g;
++                    emudiag::Reads += 2;
++                }
+                 target = ARM9Timestamp >> ARM9ClockShift;
+             }
+ 
+@@ -1765,6 +1797,8 @@ void NDS::RunSlicesJIT()
+             runARM7(target);
+             stop = CPUStop;
+         }
++        if (dsamp) [[unlikely]]
++            emudiag::T[emudiag::ARM7] += emudiag::Now() - dt0;
+ 
+         // RunSystem(target), FastSched
+         SCHED(sb, SysTimestamp) = target;
+diff --git a/src/net/LAN.cpp b/src/net/LAN.cpp
+index 19933af..e43ed0c 100644
+--- a/src/net/LAN.cpp
++++ b/src/net/LAN.cpp
+@@ -45,6 +45,7 @@
+ #endif
+ 
+ #include "LAN.h"
++#include "../EmuDiag.h"
+ #include <random>
+ 
+ 
+@@ -120,6 +121,7 @@ static void NoteWait(u64 start)
+     WaitUS += us; NWaits++;
+     if (us > WaitMaxUS) WaitMaxUS = us;
+     FrameWaitUS += us;
++    melonDS::emudiag::LANWaitUS += us;
+ }
+ 
+ static bool Allow(Rate& r, int max, const char* cat)
+-- 
+2.47.3
+

@@ -318,6 +318,14 @@ private:
     void save_writer();
     long slice_stats_ = 0;        // core.slice_stats: log the slice's statistics every this many frames
     long slice_frames_ = 0;
+    // diag.emu (BANANADS_DIAG_EMU=1; melonDS patch 0401): a "[diag] EMU" line a second, where RunFrame's time goes
+    void diag_emu_setup();
+    void diag_emu_frame(uint64_t ticks);
+    bool diag_emu_ = false;
+    uint64_t de_start_ = 0, de_rf_ = 0, de_rfmax_ = 0, de_wmax_ = 0, de_freq_ = 1;
+    double de_read_ns_ = 0;  // a timer read's cost, measured at the start
+    long de_frames_ = 0;
+    int de_temp_fd_ = -1, de_mhz_fd_ = -1, de_cool_fd_ = -1;
     std::unique_ptr<Profiler> prof_;  // prof.hz: the emulator's thread sampled (prof.cpp), off by default
     long frames_run_ = 0;
     // run-ahead's snapshot (run_ahead)
