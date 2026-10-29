@@ -116,4 +116,9 @@ own screens) ends its session and waits; with others in it, after 30 s off. A UD
   The value in use is logged at startup ("LAN: MP receive timeout"); with the variable set, the per-second
   "[diag] LAN last" line comes at the Info level on both sides, with the waits (count, total, longest) and the
   host's reply waits that timed out.
+- **0097** (LAN, for testing, diag-respuesta): with `BANANADS_LAN_TIMEOUT_MS` set, a second per-second line,
+  "[diag] LAN resp" (times in ms, mean/p95[/max]): `frames` in the window, `run` (RunFrame's time, its LAN waits
+  included), `emu` (the same minus those waits), `sleep` (the pacer's, in the window, from the frontend); on the host
+  `rtt` (a MP command sent to all its replies in) and `pre` (the command sent to the start of that wait); on a child
+  `reply` (the host's command handed to its emulation to its reply sent).
 - Their other "[diag]" traces log at the Debug level only (`log.level = 0`).

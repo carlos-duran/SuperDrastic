@@ -59,6 +59,7 @@ public:
     void notice(const char* line1, const char* line2);
     bool take_notice(std::string& line1, std::string& line2);
     void run_frame();                          // one DS frame (~1/59.83 s)
+    void diag_sleep(long long us);             // the pacer slept us (diag-respuesta, LAN diagnostics)
     // the game's own frames: its 3D buffer swaps so far (a game that can't finish a frame in one DS frame swaps
     // every other one or less, as on a DS, while the emulator still runs 60 DS frames a second); any thread
     long swaps3d() const { return swaps3d_.load(std::memory_order_relaxed); }
