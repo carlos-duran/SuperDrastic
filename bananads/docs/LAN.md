@@ -121,4 +121,12 @@ own screens) ends its session and waits; with others in it, after 30 s off. A UD
   included), `emu` (the same minus those waits), `sleep` (the pacer's, in the window, from the frontend); on the host
   `rtt` (a MP command sent to all its replies in) and `pre` (the command sent to the start of that wait); on a child
   `reply` (the host's command handed to its emulation to its reply sent).
+- **0098** (LAN, for testing, diag-respuesta-temprana; no behavior change): with `BANANADS_LAN_TIMEOUT_MS` set, a
+  child logs "[diag] LAN early" once a second: its reply slot (`W_TXSlotReply1`, the frame, its length, valid and
+  short enough for the CMD's reply time) snapshotted when the host's CMD arrives (`arr`) and when its reception starts
+  (`rx`), against what `SendMPReply` sends at the end of that reception: `ok` (the same frame, less the TX header and
+  the sequence control), `blank` (no reply either time), `pay` (another payload; `pay offs`, the first differing
+  802.11 offsets of up to 4 `arr` samples), `len`, `notready` (no valid slot then, one at the reply), `gone` (the
+  reverse), `nosnap`; `validatarr`; `slot1 writes` (of `W_TXSlotReply1`, its latch and reset included) and `buf
+  writes` (into the snapshotted frame) between the CMD's arrival and the reply, and in how many replies.
 - Their other "[diag]" traces log at the Debug level only (`log.level = 0`).
