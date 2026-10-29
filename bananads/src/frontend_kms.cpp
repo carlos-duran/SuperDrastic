@@ -1623,7 +1623,7 @@ static void mh_cheat_set(void* c, int i, int on) {
     Log(LogLevel::Info, "[cheats] %s: %s\n", mh_cheat_name(nullptr, i), on ? "on" : "off");
 }
 static void mh_log(void*, const char* line) { Log(LogLevel::Info, "%s", line); }
-// LAN multiplayer (menu.h): the emulator's LAN state for the menu's page, and the menu's picks for the emulator. The
+// Local multiplayer (menu.h): the emulator's LAN state for the menu's page, and the menu's picks for the emulator. The
 // mode and Host's size (Auto's too) are kept in bananads.conf (wifi.local, wifi.local_players) for the next game; a join
 // keeps "join" (look for hosts at the start), not the host's address, which can change. BANANADS_WIFI_LOCAL and
 // BANANADS_WIFI_LOCAL_PLAYERS (bananads.env) win over bananads.conf at each start: the page says so

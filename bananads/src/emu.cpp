@@ -183,7 +183,7 @@ void Emu::setup_wifi() {
 
 // Local wireless with another handheld (Pokémon trades and battles, Mario Kart's local races, PictoChat):
 // wifi.local = host on one, join:<the host's address> (or join: look for hosts, and pick one in the in-game menu's
-// LAN multiplayer page) on the other, or auto on both (lan_auto_tick). Both on the same network. The menu can
+// Local multiplayer page) on the other, or auto on both (lan_auto_tick). Both on the same network. The menu can
 // change it while the game runs (lan_request).
 void Emu::setup_local() {
     const std::string mode = cfg_.str("wifi.local", "off");

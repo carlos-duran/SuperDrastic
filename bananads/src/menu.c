@@ -149,7 +149,7 @@ static const char *const IC_LOAD[12] = { "............", ".####.......", "#....#
     "#....##....#", "#..######..#", "#...####...#", "#....##....#", "#..........#", "############" };
 static const char *const IC_SLIDERS[12] = { "............", "..##........", "############", "..##........", "............", "........##..",
     "############", "........##..", "............", ".....##.....", "############", ".....##....." };
-/* LAN multiplayer: the Wi-Fi arcs */
+/* Local multiplayer: the Wi-Fi arcs */
 static const char *const IC_LAN[12] = { "............", "...######...", ".##......##.", "#...####...#", "..##....##..", ".#...##...#.",
     "....#..#....", ".....##.....", ".....##.....", "............", "............", "............" };
 static const char *const IC_LIST[12] = { "............", "##.#########", "##.#########", "............", "............", "##.#########",
@@ -820,7 +820,7 @@ static long long off_note_until;
 static int tile_off(int i) { return mp_locked && (i == 1 || i == 2 || i == 4); }
 static int cheats_off(void) { return mp_locked; }   /* a code changes the game the other handhelds play with */
 
-/* LAN multiplayer (Quick settings > LAN multiplayer): wifi.local from the menu. The frontend reports the state (H.lan_get,
+/* Local multiplayer (Quick settings > Local multiplayer): wifi.local from the menu. The frontend reports the state (H.lan_get,
  * looked at twice a second while a LAN page is open) and carries out a mode change (H.lan_set) on the emulator's
  * thread, so the menu never waits on the network: a join shows "Connecting" until it is done. Modes change only
  * outside a local wireless game; in one, Disconnect is all there is (in Auto, Off; the others' game shows its own
@@ -861,16 +861,20 @@ static int lan_closed(void) { return LS.no_net && !lan_link_row(); }
 /* Connection: only with the mode Off (a mode on would have to start again on the other connection) */
 static int lan_link_off(void) { return LS.mode != BM_LAN_OFF || lan_locked(); }
 static int lan_linking(void) { return LS.link && LS.mode != BM_LAN_OFF && LS.link_state == BM_LINK_STARTING; }
+/* Connection first (it is on the page in every mode, Off included, and is picked before a mode), then Mode; the
+ * cursor starts on Mode (lan_mode_row): Connection changes only with Off, Mode is what a visit is mostly for */
 static void lan_rows(void) {
-    nlrows = 0; lrows[nlrows++] = LR_MODE;
+    nlrows = 0;
     if (lan_link_row()) lrows[nlrows++] = LR_LINK;
+    lrows[nlrows++] = LR_MODE;
     if (lan_pick == BM_LAN_HOST) lrows[nlrows++] = LR_PLAYERS;   /* (the Mode row on Host; greyed till Host is on) */
     if (lan_pick == BM_LAN_JOIN && LS.mode == BM_LAN_JOIN && LS.state != BM_LAN_READY) lrows[nlrows++] = LR_HOSTS;
     if (lan_pick == LS.mode && (LS.mode == BM_LAN_HOST || LS.mode == BM_LAN_JOIN) && LS.state == BM_LAN_READY) lrows[nlrows++] = LR_LEAVE;
     if (sel_lan >= nlrows) sel_lan = nlrows - 1;
 }
-static void lan_open(void) {   /* Quick settings > LAN multiplayer */
-    lan_poll(); lan_pick = LS.mode; lan_max_pick = LS.host_players >= 2 ? LS.host_players : 4; sel_lan = 0; lan_joining = 0;
+static int lan_mode_row(void) { return lan_link_row() ? 1 : 0; }   /* the Mode row's index (lan_rows) */
+static void lan_open(void) {   /* Quick settings > Local multiplayer */
+    lan_poll(); lan_pick = LS.mode; lan_max_pick = LS.host_players >= 2 ? LS.host_players : 4; sel_lan = lan_mode_row(); lan_joining = 0;
     lan_rows();
 }
 /* the Players row (Host): the session's size, set once Host is on, while alone in it; Auto uses it too */
@@ -1045,8 +1049,8 @@ static void draw_bottom(void) {
             const char *const *ic = id == ROW_MIC ? IC_MIC : id == ROW_LAN ? IC_LAN : IC_SLIDERS;
             int k = S(2) < 2 ? 2 : S(2);
             bitmap(c, ic, 12, gx0 + S(16), y + (rh - 12 * k) / 2, k, sel ? C_ONSEL : C_LIGHT);
-            const char *lab = id == ROW_MIC ? "Microphone" : id == ROW_CHEAT ? "Cheats" : id == ROW_LAN ? "LAN multiplayer" : H.opt_label(H.ctx, id - ROW_OPT);
-            const int dim_row = id == ROW_LAN && lan_closed();   /* LAN multiplayer: no Wi-Fi */
+            const char *lab = id == ROW_MIC ? "Microphone" : id == ROW_CHEAT ? "Cheats" : id == ROW_LAN ? "Local multiplayer" : H.opt_label(H.ctx, id - ROW_OPT);
+            const int dim_row = id == ROW_LAN && lan_closed();   /* Local multiplayer: no Wi-Fi */
             text(c, &F_MED, lab, gx0 + S(56), y + (rh - S(20)) / 2.0f - S(1), S(20), sel ? C_ONSEL : dim_row ? C_DIM : C_LIGHT, 0, 0);
             char v[32] = "";
             if (id == ROW_MIC) snprintf(v, sizeof v, "Test / blow");
@@ -1128,7 +1132,7 @@ static void draw_bottom(void) {
     else if (s == SC_LAN) {
         const int locked = lan_locked();
         char sub[64]; lan_short(sub, sizeof sub);
-        draw_header(c, "LAN multiplayer", sub, 1);
+        draw_header(c, "Local multiplayer", sub, 1);
         lan_rows();
         int y = gy0, rh = S(44), gap = S(6);
         for (int r = 0; r < nlrows; r++) {
@@ -1271,13 +1275,13 @@ static void draw_bottom(void) {
         const int n = LS.nhosts;
         if (!n && LS.link) {   /* Direct: the other consoles on Direct too (no computer: it isn't on the link) */
             const char *l[] = { lan_linking() ? "Starting the direct link..." : "Looking for hosts...", "",
-                "On the other console: LAN multiplayer,", "Connection Direct, then Mode Host.",
+                "On the other console: Local multiplayer,", "Connection Direct, then Mode Host.",
                 "No router: the consoles link directly. A host", "shows up here within a few seconds." };
             for (int i = 0; i < 6; i++)
                 text(c, i ? &F_REG : &F_MED, l[i], gx0 + S(8), gy0 + S(16) + i * S(30), i ? S(17) : S(21), i ? C_BODY : C_LIGHT, gx1 - gx0 - S(16), 0);
         } else if (!n) {
             const char *l[] = { "Looking for hosts...", "",
-                "On the other console: LAN multiplayer > Host.", "On a computer: melonDS, Multiplayer > Host LAN game.",
+                "On the other console: Local multiplayer > Host.", "On a computer: melonDS, Multiplayer > Host LAN game.",
                 "Both on the same Wi-Fi network. A host shows up", "here within a second or two." };
             for (int i = 0; i < 6; i++)
                 text(c, i ? &F_REG : &F_MED, l[i], gx0 + S(8), gy0 + S(16) + i * S(30), i ? S(17) : S(21), i ? C_BODY : C_LIGHT, gx1 - gx0 - S(16), 0);
@@ -1462,19 +1466,19 @@ static void do_load(int n) {
     if (!ok) mlog("[menu] %s couldn't be loaded\n", n < 0 ? "the undo slot" : "the slot");
     play(SND_SELECT); close_menu();
 }
-/* LAN multiplayer's actions */
+/* Local multiplayer's actions */
 static void lan_leave(void) {   /* Disconnect: a host's session ends (Off); a joined player goes back to looking.
                                   * Auto (Off, in a local wireless game): off, the session ends or is left */
     if (LS.mode == BM_LAN_AUTO) {
         mlog("[menu] LAN: off (in a local wireless game)\n");
         H.lan_set(H.ctx, BM_LAN_OFF, 0, ""); lan_pick = BM_LAN_OFF;
-        lan_poll(); scr = SC_LAN; sel_lan = 0; play(SND_SELECT); dirty_top = dirty_bot = 1;
+        lan_poll(); scr = SC_LAN; sel_lan = lan_mode_row(); play(SND_SELECT); dirty_top = dirty_bot = 1;
         return;
     }
     mlog("[menu] LAN: disconnect (%s)\n", LS.mode == BM_LAN_HOST ? "the session ends" : "back to looking for hosts");
     if (LS.mode == BM_LAN_HOST) { H.lan_set(H.ctx, BM_LAN_OFF, 0, ""); lan_pick = BM_LAN_OFF; }
     else H.lan_set(H.ctx, BM_LAN_JOIN, 0, "");
-    lan_poll(); scr = SC_LAN; sel_lan = 0; play(SND_SELECT); dirty_top = dirty_bot = 1;
+    lan_poll(); scr = SC_LAN; sel_lan = lan_mode_row(); play(SND_SELECT); dirty_top = dirty_bot = 1;
 }
 static void lan_activate(void) {
     lan_rows();
@@ -1781,10 +1785,10 @@ int bmenu_run(int start) {
         { static long long mt; if (scr == SC_MIC && now_ms() - mt >= 33) { mt = now_ms(); dirty_bot = 1; } }   /* the meter moves */
         if ((scr == SC_LAN || scr == SC_LAN_HOSTS || scr == SC_LAN_LEAVE || scr == SC_LAN_SWITCH || scr == SC_SET) && now_ms() - lan_polled >= 500) {
             if (lan_poll()) dirty_bot = 1;   /* the LAN's state, twice a second; a join done: back to the page */
-            if (scr == SC_LAN_HOSTS && lan_joining && !(LS.state == BM_LAN_BUSY && LS.addr[0])) { lan_joining = 0; scr = SC_LAN; sel_lan = 0; dirty_bot = 1; }
+            if (scr == SC_LAN_HOSTS && lan_joining && !(LS.state == BM_LAN_BUSY && LS.addr[0])) { lan_joining = 0; scr = SC_LAN; sel_lan = lan_mode_row(); dirty_bot = 1; }
             if (scr == SC_LAN_LEAVE && LS.state != BM_LAN_READY) { scr = SC_LAN; dirty_bot = 1; }
             if (scr == SC_LAN_SWITCH && (!lan_with_others() || lan_locked())) { scr = SC_LAN; dirty_bot = 1; }   /* nobody left: no question */
-            if (scr == SC_LAN_HOSTS && LS.no_net) { lan_joining = 0; scr = SC_LAN; sel_lan = 0; dirty_bot = 1; }   /* the network went */
+            if (scr == SC_LAN_HOSTS && LS.no_net) { lan_joining = 0; scr = SC_LAN; sel_lan = lan_mode_row(); dirty_bot = 1; }   /* the network went */
         }
         { static long long vt; if (scr == SC_SET && now_ms() - vt >= 500) { vt = now_ms(); want_ex(-1, -1, 1); }   /* the volume keys' */
           int r = vol_read; if (r >= 0) { vol_read = -1; if (scr == SC_SET && r != vol && now_ms() - vol_set_at > 1500) { vol = r; dirty_bot = 1; } } }

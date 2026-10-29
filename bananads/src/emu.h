@@ -130,7 +130,7 @@ public:
     // each frame and each service_net; any thread may ask (the menu turns Save, Load and Restart off)
     bool mp_active() const { return mp_active_.load(std::memory_order_relaxed); }
 
-    // ---- wifi.local from the in-game menu (Quick settings > LAN multiplayer) ----
+    // ---- wifi.local from the in-game menu (Quick settings > Local multiplayer) ----
     // The menu asks from its own thread; the emulator's thread carries it out between two frames or in the paused
     // menu's service loop (service_net), never while another thread runs the game. Joining waits up to 5 s for the
     // host (melonDS's StartClient): the state says Busy meanwhile, and the menu stays usable.

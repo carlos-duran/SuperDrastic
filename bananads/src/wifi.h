@@ -99,7 +99,7 @@ private:
     uint16_t ipid_ = 1;
 };
 
-// ---- the direct link (wifi.local_link = direct: LAN multiplayer without a router) ---------------------------
+// ---- the direct link (wifi.local_link = direct: Local multiplayer without a router) ---------------------------
 // BananaOS's /usr/libexec/banana/wifi-link (link.script, BANANADS_LINK_SCRIPT, to test another one) puts this
 // handheld and the others on an IBSS cell of their own, with addresses in 10.42.0.0/16, and puts the home Wi-Fi
 // back when it comes down; its own supervisor also does that when BananaDS is gone (--owner, a crash) or stopped (a

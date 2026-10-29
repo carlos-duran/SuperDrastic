@@ -10,11 +10,11 @@ settings are in [SETTINGS.md](SETTINGS.md) (`wifi.local`, `wifi.local_players`, 
 Desktop melonDS's own LAN dialog warns, and so does the menu's page: LAN requires low network latency to work; do
 not expect it to work through a VPN or any sort of tunnel.
 
-## The in-game menu's LAN multiplayer page (Quick settings > LAN multiplayer)
+## The in-game menu's Local multiplayer page (Quick settings > Local multiplayer)
 
-- **Connection: Router / Direct** (only when the direct link's script is there, below; changed only with the mode
-  Off, kept in `wifi.local_link`): Router plays over the Wi-Fi network the console is on; Direct links the
-  consoles without a router.
+- **Connection: Router / Direct**, the first row in every mode (only when the direct link's script is there,
+  below; changed only with the mode Off, kept in `wifi.local_link`; the cursor opens on Mode, under it): Router
+  plays over the Wi-Fi network the console is on; Direct links the consoles without a router.
 - **Mode: Off / Auto / Host / Join**, changed while the game runs, without a restart, and kept in `bananads.conf`
   (`wifi.local = off | auto | host | join`; `join` looks for hosts at the start, `join:<address>` joins that host
   directly). `BANANADS_WIFI_LOCAL` / `BANANADS_WIFI_LOCAL_PLAYERS` in the environment still win at each start, and
