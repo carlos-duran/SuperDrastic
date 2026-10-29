@@ -129,4 +129,13 @@ own screens) ends its session and waits; with others in it, after 30 s off. A UD
   802.11 offsets of up to 4 `arr` samples), `len`, `notready` (no valid slot then, one at the reply), `gone` (the
   reverse), `nosnap`; `validatarr`; `slot1 writes` (of `W_TXSlotReply1`, its latch and reset included) and `buf
   writes` (into the snapshotted frame) between the CMD's arrival and the reply, and in how many replies.
+- **0099** (LAN, respuesta-temprana; off unless `BANANADS_LAN_EARLY_REPLY=1`): a child sends its reply to the host's
+  CMD from `CheckRX` as the CMD arrives, instead of at the end of the CMD's emulated reception, built as that end
+  would: the reply slot's frame (`SendMPReply`'s checks, `TXSendFrame`'s sequence number, retry bit, WEP FCS and
+  channel), else the default empty reply, or the blank one if the CMD isn't for us; stamped with the time the
+  reception ends (`RXTimestamp` plus the CMD's air time), which the host's `RecvReplies` checks against its own
+  (the CMD's end, -32 us). The end of the reception keeps every emulated side effect but sends nothing: what it would
+  have sent is compared with what went out. "[diag] LAN early-reply", a second: what went out (`frame`, `default`,
+  `blank`), then `ok` and the mismatches (`kind`, `len`, `hdr` (bytes 0-11), `seq`, `pay`, the first `offs`),
+  `orphan` (a reception that never ended) and the late - early time stamps in us. A mismatch is never resent.
 - Their other "[diag]" traces log at the Debug level only (`log.level = 0`).

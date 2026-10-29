@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carlos Duran <15650777+carlos-duran@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:59:11 -0500
+Subject: [PATCH] LAN: respuesta-temprana, a MP client's reply sent as the
+ host's CMD arrives
+
+With BANANADS_LAN_EARLY_REPLY=1 (off by default), as a MP client: the
+reply to the host's CMD goes out from CheckRX as the CMD arrives, built
+as the end of its emulated reception would build it (the reply slot's
+frame with SendMPReply's checks and TXSendFrame's sequence number,
+retry bit, WEP FCS and channel; else the default empty reply; the blank
+one if the CMD isn't for us), stamped with the time that reception ends,
+which the host's RecvReplies checks. The end of the reception keeps all
+of its emulated side effects but doesn't send the reply again: what it
+would have sent is compared with what went out, and the mismatches are
+counted ("[diag] LAN early-reply" once a second), never resent.
+---
+ src/Wifi.cpp | 160 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 159 insertions(+), 1 deletion(-)
+
+diff --git a/src/Wifi.cpp b/src/Wifi.cpp
+index 6b0d9dc..ac331f8 100644
+--- a/src/Wifi.cpp
++++ b/src/Wifi.cpp
+@@ -91,6 +91,89 @@ bool MACIsBroadcast(const u8* a)
+ 
+ // BananaDS diagnostics: Debug level (BananaDS log.level 0), "[diag]" prefix, each category at most N lines a second
+ // (the lines held back are counted and reported with the category's next line)
++// BananaDS respuesta-temprana (BANANADS_LAN_EARLY_REPLY=1; off by default): as a MP client, the reply to the host's
++// CMD goes out as soon as the CMD reaches us (CheckRX) instead of at the end of its emulated reception. It is built
++// the way the end of the reception would: the reply slot's frame (W_TXSlotReply1, with SendMPReply's checks) with
++// TXSendFrame's sequence number, retry bit, WEP FCS and channel, else the default empty reply, or the blank one if
++// the CMD isn't for us; stamped with the time the reception ends (the CMD's RXTimestamp plus its air time), what the
++// host's RecvReplies checks. At the end of the reception the emulation does all it did (Reply1 -> Reply2, the
++// previous reply marked sent, the sequence number, the TX count, the IRQs and status), except sending the reply
++// again: what it would have sent is only compared with what went out, a mismatch counted and logged, never resent.
++// A line a second, "[diag] LAN early-reply".
++namespace erep
++{
++static int On()
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        const char* e = getenv("BANANADS_LAN_EARLY_REPLY");
++        v = (e && e[0] == '1' && !e[1]) ? 1 : 0;
++        if (v) Log(LogLevel::Info, "LAN: MP early reply on (BANANADS_LAN_EARLY_REPLY)\n");
++    }
++    return v;
++}
++enum { KFrame = 1, KDefault = 2, KBlank = 3 };
++static bool Pending;
++static int Kind, Len;
++static u64 TS;
++static u8 Buf[12 + 0x2000];
++// per window
++static int NSent[4], NOK, NKind, NLen, NHdr, NSeq, NPay, NOrphan;
++static s64 DMin, DMax, DSum; static int DN;
++static int Offs[4], NOffs;
++static u64 WinStart;
++
++static void Flush(bool force)
++{
++    const u64 t = Platform::GetMSCount();
++    if (!WinStart) WinStart = t;
++    if (!force && t - WinStart < 1000) return;
++    if (NSent[1] + NSent[2] + NSent[3] + NOrphan)
++        Log(LogLevel::Info, "[diag] LAN early-reply: sent frame=%d default=%d blank=%d; at the reception's end ok=%d "
++            "kind=%d len=%d hdr=%d seq=%d pay=%d orphan=%d; ts late-early us min=%lld mean=%.1f max=%lld; offs=%d,%d,%d,%d\n",
++            NSent[1], NSent[2], NSent[3], NOK, NKind, NLen, NHdr, NSeq, NPay, NOrphan,
++            (long long)(DN ? DMin : 0), DN ? (double)DSum / DN : 0.0, (long long)(DN ? DMax : 0),
++            NOffs > 0 ? Offs[0] : -1, NOffs > 1 ? Offs[1] : -1, NOffs > 2 ? Offs[2] : -1, NOffs > 3 ? Offs[3] : -1);
++    NSent[1] = NSent[2] = NSent[3] = NOK = NKind = NLen = NHdr = NSeq = NPay = NOrphan = 0;
++    DMin = DMax = DSum = 0; DN = 0; NOffs = 0;
++    WinStart = t;
++}
++
++static void Sent(int kind, int len, u64 ts)
++{
++    if (Pending) NOrphan++;  // the previous CMD's reception never ended
++    Pending = true; Kind = kind; Len = len; TS = ts; NSent[kind]++;
++    Flush(false);
++}
++
++// at the end of the reception: what would have been sent (nothing is)
++static void Late(int kind, const u8* buf, int len, u64 ts)
++{
++    Pending = false;
++    const s64 d = (s64)ts - (s64)TS;
++    if (!DN || d < DMin) DMin = d;
++    if (!DN || d > DMax) DMax = d;
++    DSum += d; DN++;
++    if (kind != Kind) NKind++;
++    else if (len != Len) NLen++;
++    else
++    {
++        int i = (kind == KDefault) ? 8 : 0;  // (the default reply's first 8 bytes are never set)
++        for (; i < len; i++) if (buf[i] != Buf[i]) break;
++        if (i >= len) NOK++;
++        else
++        {
++            if (i < 12) NHdr++;
++            else if (i == 12 + 22 || i == 12 + 23) NSeq++;
++            else NPay++;
++            if (NOffs < 4) Offs[NOffs++] = i;
++        }
++    }
++    Flush(false);
++}
++}
++
+ // BananaDS diag-respuesta-temprana (BANANADS_LAN_TIMEOUT_MS set; diagnostics only, behavior unchanged): as a MP
+ // client, what an early MP reply would have carried, snapshotted when the host's CMD reaches us (CheckRX: "arr") and
+ // when its emulated reception starts (StartRX: "rx"), against what SendMPReply sends at the end of that reception.
+@@ -924,6 +1007,7 @@ void Wifi::TXSendFrame(const TXSlot* slot, int num)
+ 
+     case 5:
+         IncrementTXCount(slot);
++        if (erep::Pending) { erep::Late(erep::KFrame, TXBuffer, 12+len, USTimestamp); break; }  // sent at the CMD's arrival
+         Platform::MP_SendReply(TXBuffer, 12+len, USTimestamp, IOPORT(W_AIDLow), NDS.UserData);
+         break;
+ 
+@@ -1086,6 +1170,7 @@ void Wifi::SendMPDefaultReply()
+     *(u32*)&reply[0xC + 0x18] = 0;
+ 
+     diag::Frame("TX", diag::TxRates, reply, 12+28, "default-reply", USTimestamp);
++    if (erep::Pending) { erep::Late(erep::KDefault, reply, 12+28, USTimestamp); return; }  // sent at the CMD's arrival
+     int txlen = Platform::MP_SendReply(reply, 12+28, USTimestamp, IOPORT(W_AIDLow), NDS.UserData);
+     WIFI_LOG("wifi: sent %d/40 bytes of MP default reply\n", txlen);
+ }
+@@ -1782,7 +1867,8 @@ void Wifi::FinishRX()
+             if (diag::Allow(diag::TxRates[1], 10, "TX MP"))
+                 Log(LogLevel::Debug, "[diag] TX MP-REPLY blank (AID=%d, clientmask=%04X) ts=%llu\n",
+                     IOPORT(W_AIDLow), clientmask, (unsigned long long)USTimestamp);
+-            Platform::MP_SendReply(nullptr, 0, USTimestamp, 0, NDS.UserData);
++            if (erep::Pending) erep::Late(erep::KBlank, nullptr, 0, USTimestamp);  // sent at the CMD's arrival
++            else Platform::MP_SendReply(nullptr, 0, USTimestamp, 0, NDS.UserData);
+         }
+     }
+     else if ((rxflags & 0x800F) == 0x8001)
+@@ -1998,6 +2084,78 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
+             if (IOPORT(W_AIDLow) && (clientmask & (1 << IOPORT(W_AIDLow))))
+                 rdiag::Arrived(RAM, IOPORT(W_TXSlotReply1), clienttime, PreambleLen(2), false);
+ 
++            if (erep::On() && CurChannel != 0)
++            {
++                // the reply now, as the end of this CMD's reception (NextSync, so far) would send it
++                const u64 ts = NextSync;
++                u8* b = erep::Buf;
++                if (IOPORT(W_AIDLow) && (clientmask & (1 << IOPORT(W_AIDLow))))
++                {
++                    // SendMPReply
++                    const u16 r1 = IOPORT(W_TXSlotReply1);
++                    bool valid = (r1 & 0x8000) != 0;
++                    u16 a = 0; int l = 0;
++                    if (valid)
++                    {
++                        a = (r1 & 0x0FFF) << 1;
++                        l = *(u16*)&RAM[a + 0xA] & 0x3FFF;
++                        if ((u32)(PreambleLen(2) + l * 4) > clienttime) valid = false;
++                    }
++                    if (valid)
++                    {
++                        // TXSendFrame (slot 5)
++                        int len = l;
++                        if ((a + len) > 0x1FF4) len = 0x1FF4 - a;
++                        memcpy(b, &RAM[a], 12 + len);
++                        // SendMPReply marks the previous reply sent (in RAM) before it
++                        const u16 pa = TXSlots[5].Addr;
++                        if ((IOPORT(W_TXSlotReply2) & 0x8000) && pa >= a && pa + 2 <= a + 12 + len)
++                            *(u16*)&b[pa - a] = 0x0001;
++                        const int noseqno = b[4] ? 2 : 0;
++                        if (!noseqno && !(IOPORT(W_TXHeaderCnt) & (1<<2)))
++                            *(u16*)&b[0xC + 22] = IOPORT(W_TXSeqNo) << 4;
++                        if ((*(u16*)&b[0xC] & (1<<14)) && (IOPORT(W_WEPCnt) & (1<<15)))
++                        {
++                            const u32 w = ((a + 0xC + l - 7) & ~0x1) - a;
++                            if (w + 4 <= (u32)(12 + len)) *(u32*)&b[w] = 0x22334466;
++                        }
++                        if (noseqno == 2) *(u16*)&b[0xC] |= (1<<11);
++                        b[9] = CurChannel;
++                        Platform::MP_SendReply(b, 12 + len, ts, IOPORT(W_AIDLow), NDS.UserData);
++                        erep::Sent(erep::KFrame, 12 + len, ts);
++                    }
++                    else
++                    {
++                        // SendMPDefaultReply
++                        memset(b, 0, 12 + 28);
++                        *(u16*)&b[0xA] = 28;
++                        b[0x8] = 0x14;
++                        b[0x9] = CurChannel;
++                        *(u16*)&b[0xC + 0x00] = 0x0158;
++                        *(u16*)&b[0xC + 0x02] = 0x00F0;
++                        *(u16*)&b[0xC + 0x04] = IOPORT(W_BSSID0);
++                        *(u16*)&b[0xC + 0x06] = IOPORT(W_BSSID1);
++                        *(u16*)&b[0xC + 0x08] = IOPORT(W_BSSID2);
++                        *(u16*)&b[0xC + 0x0A] = IOPORT(W_MACAddr0);
++                        *(u16*)&b[0xC + 0x0C] = IOPORT(W_MACAddr1);
++                        *(u16*)&b[0xC + 0x0E] = IOPORT(W_MACAddr2);
++                        *(u16*)&b[0xC + 0x10] = 0x0903;
++                        *(u16*)&b[0xC + 0x12] = 0x00BF;
++                        *(u16*)&b[0xC + 0x14] = 0x1000;
++                        *(u16*)&b[0xC + 0x16] = IOPORT(W_TXSeqNo) << 4;
++                        *(u32*)&b[0xC + 0x18] = 0;
++                        Platform::MP_SendReply(b, 12 + 28, ts, IOPORT(W_AIDLow), NDS.UserData);
++                        erep::Sent(erep::KDefault, 12 + 28, ts);
++                    }
++                }
++                else
++                {
++                    // not for us: the blank (FinishRX)
++                    Platform::MP_SendReply(nullptr, 0, ts, 0, NDS.UserData);
++                    erep::Sent(erep::KBlank, 0, ts);
++                }
++            }
++
+             // include the MP reply time window
+             NextSync += 112 + ((clienttime + 10) * NumClients(clientmask));
+         }
