@@ -1652,6 +1652,14 @@ static int mh_lan_get(void*, bmenu_lan* st) {
     st->link_state = l.link_state;
     lan_copy(st->link_ip, sizeof st->link_ip, l.link_ip);
     st->link_channel = l.link_freq >= 2412 && l.link_freq <= 2472 ? (l.link_freq - 2407) / 5 : 0;
+    {   // the link starting: the script's phase and the seconds so far
+        std::string ph;
+        int secs = 0;
+        if (l.link_state == 1 && g_lan_emu->lan_link_progress(ph, secs)) {
+            lan_copy(st->link_phase, sizeof st->link_phase, ph);
+            st->link_secs = secs;
+        }
+    }
     std::string env;
     for (const char* k : {"BANANADS_WIFI_LOCAL", "BANANADS_WIFI_LOCAL_PLAYERS", "BANANADS_WIFI_LOCAL_LINK"}) {
         const char* v = getenv(k);

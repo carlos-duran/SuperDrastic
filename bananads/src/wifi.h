@@ -113,6 +113,7 @@ public:
         State state = State::Down;
         std::string role, ip, msg;  // role "host" or "join"; ip ours on the link; msg: a failure's reason
         int freq = 0;               // MHz
+        uint64_t since_ms = 0;      // Starting: when the up began (steady clock, ms)
     };
     explicit DirectLink(std::string script, int channel = 0);  // channel 1-11, 0: the script's own (1)
     ~DirectLink();  // a command still running is stopped (the script's supervisor keeps or restores the link)
@@ -122,6 +123,9 @@ public:
     void down();                       // queued; an up running or queued is dropped (its supervisor told by down)
     bool down_wait(int timeout_ms);    // down, and wait for it (the quit): false if it didn't end in time
     Status status() const;
+    // Starting: what the script reports it is doing (its state file's phase: leaving, search, joining, starting;
+    // "" before it says) and the seconds since the up began. false when not starting
+    bool progress(std::string& phase, int& secs) const;
     uint32_t generation() const { return gen_.load(std::memory_order_acquire); }  // +1 at every status change
     // run "sh script args...": its output's lines in out; its exit status (-1: couldn't run, -2: timed out, killed)
     static int run(const std::string& script, const std::vector<std::string>& args, int timeout_ms,
@@ -132,6 +136,7 @@ private:
     void worker();
     void set(const Status& s);
     std::string script_;
+    std::string dir_;  // the script's state dir (BANANA_LINK_DIR, as the script has it: /run/banana/wifi-link)
     int channel_ = 0;
     mutable std::mutex mu_;
     std::condition_variable cv_;

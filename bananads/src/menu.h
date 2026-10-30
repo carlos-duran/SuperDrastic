@@ -52,6 +52,8 @@ typedef struct {
     int link_state;       /* BM_LINK_* */
     char link_ip[48];     /* up: our address on the link */
     int link_channel;     /* up: its 2.4 GHz channel (0: unknown) */
+    char link_phase[16];  /* starting: the script's phase (leaving, search, joining, starting; "" not said yet) */
+    int link_secs;        /* starting: seconds since the link began to come up */
 } bmenu_lan;
 
 typedef struct {

@@ -199,7 +199,9 @@ void Emu::setup_local() {
     {   // the direct link: BananaOS's wifi-link (link.script = BANANADS_LINK_SCRIPT for another one, to test it)
         const std::string script = cfg_.str("link.script", "/usr/libexec/banana/wifi-link");
         if (DirectLink::usable(script)) link_ = std::make_unique<DirectLink>(script, (int)cfg_.num("wifi.local_link_channel", 0));
-        link_direct_ = link_ && cfg_.str("wifi.local_link", "router") == "direct";
+        // (Direct by default when the script is there: the steadier of the two on the handhelds; a saved
+        // wifi.local_link = router still wins)
+        link_direct_ = link_ && cfg_.str("wifi.local_link", "direct") == "direct";
         std::lock_guard<std::mutex> l(lan_mu_);
         lan_st_.link_avail = link_ != nullptr;
         lan_st_.link_direct = link_direct_;
@@ -233,6 +235,15 @@ void Emu::setup_local() {
 #else
     if (mode == "off") return;
     Log(LogLevel::Warn, "[wifi] wifi.local=%s, but this build has no local wireless (BANANADS_LAN)\n", mode.c_str());
+#endif
+}
+
+bool Emu::lan_link_progress(std::string& phase, int& secs) const {
+#ifdef BANANADS_LAN
+    return link_ && link_->progress(phase, secs);
+#else
+    (void)phase; (void)secs;
+    return false;
 #endif
 }
 

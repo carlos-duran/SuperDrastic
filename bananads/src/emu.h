@@ -169,6 +169,7 @@ public:
     void lan_request(LanMode mode, const std::string& addr = "", int max_players = 0);  // any thread
     // Connection: Direct (true) or Router; only with the mode Off (otherwise ignored). Any thread
     void lan_link_request(bool direct);
+    bool lan_link_progress(std::string& phase, int& secs) const;  // the direct link starting: DirectLink::progress
     std::string state_path(int slot) const;
 
     Mic& mic() { return mic_; }
