@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carlos Duran <15650777+carlos-duran@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:38:35 -0500
+Subject: [PATCH] LAN: diag-respuesta-temprana, would an early MP reply carry
+ what the late one does
+
+As a MP client, with BANANADS_LAN_TIMEOUT_MS set: snapshot the reply
+slot (W_TXSlotReply1, its frame, length and validity against the CMD's
+reply time) when the host's CMD arrives and when its reception starts,
+compare with what SendMPReply sends at the end of the reception, count
+writes of the slot and of the reply buffer in between, and log it once
+a second as "[diag] LAN early". Diagnostics only; no behavior change.
+---
+ src/Wifi.cpp | 120 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 119 insertions(+), 1 deletion(-)
+
+diff --git a/src/Wifi.cpp b/src/Wifi.cpp
+index 3b55a55..6b0d9dc 100644
+--- a/src/Wifi.cpp
++++ b/src/Wifi.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include <stdio.h>
+ #include <string.h>
++#include <stdlib.h>
+ #include "NDS.h"
+ #include "SPI.h"
+ #include "Wifi.h"
+@@ -90,6 +91,111 @@ bool MACIsBroadcast(const u8* a)
+ 
+ // BananaDS diagnostics: Debug level (BananaDS log.level 0), "[diag]" prefix, each category at most N lines a second
+ // (the lines held back are counted and reported with the category's next line)
++// BananaDS diag-respuesta-temprana (BANANADS_LAN_TIMEOUT_MS set; diagnostics only, behavior unchanged): as a MP
++// client, what an early MP reply would have carried, snapshotted when the host's CMD reaches us (CheckRX: "arr") and
++// when its emulated reception starts (StartRX: "rx"), against what SendMPReply sends at the end of that reception.
++// A line per second, "[diag] LAN early".
++namespace rdiag
++{
++static int On()
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("BANANADS_LAN_TIMEOUT_MS"); v = (e && *e) ? 1 : 0; }
++    return v;
++}
++struct Snap { bool Have; bool Valid; u16 Slot; u16 Addr; u16 Len; u8 Data[0x400]; };
++static Snap SArr, SRx;
++static bool Pending;
++static u16 BufLo, BufHi;   // the reply buffer the snapshot saw (RAM offsets), for writes into it meanwhile
++// per window: [0] arr, [1] rx
++static int NOK[2], NOKBlank[2], NPay[2], NLen[2], NNotReady[2], NGone[2], NNoSnap[2];
++static int NReplies, NSlotWrites, NSlotWriteReplies, NBufWrites, NBufWriteReplies, NValidAtArr;
++static int NSlotW, NBufW;  // this reply's
++static int Offs[4], NOffs;
++static u64 WinStart;
++
++static void Take(Snap& sn, const u8* ram, u16 slotreg, u16 clienttime, u32 pre)
++{
++    sn.Have = true; sn.Slot = slotreg; sn.Valid = (slotreg & 0x8000) != 0; sn.Addr = 0; sn.Len = 0;
++    if (!sn.Valid) return;
++    sn.Addr = (slotreg & 0x0FFF) << 1;
++    sn.Len = *(const u16*)&ram[sn.Addr + 0xA] & 0x3FFF;
++    // as SendMPReply: rate 2 (2 Mbps), 4 us a byte
++    const u32 duration = pre + sn.Len * 4;
++    if (duration > clienttime) { sn.Valid = false; return; }
++    u32 n = 12 + sn.Len; if (n > sizeof sn.Data) n = sizeof sn.Data;
++    if (sn.Addr + n > 0x2000) n = 0x2000 - sn.Addr;
++    memcpy(sn.Data, &ram[sn.Addr], n);
++}
++
++static void Arrived(const u8* ram, u16 slotreg, u16 clienttime, u32 pre, bool rx)
++{
++    if (!On()) return;
++    Take(rx ? SRx : SArr, ram, slotreg, clienttime, pre);
++    if (!rx)
++    {
++        Pending = true; NSlotW = NBufW = 0; SRx.Have = false;
++        if (SArr.Valid) NValidAtArr++;
++        BufLo = SArr.Valid ? SArr.Addr : 0; BufHi = SArr.Valid ? (u16)(SArr.Addr + 12 + SArr.Len) : 0;
++    }
++}
++
++static void Compare(int k, const Snap& sn, bool valid, const u8* ram, u16 addr, u16 len)
++{
++    if (!sn.Have) { NNoSnap[k]++; return; }
++    if (!sn.Valid && !valid) { NOKBlank[k]++; return; }
++    if (!sn.Valid) { NNotReady[k]++; return; }
++    if (!valid) { NGone[k]++; return; }
++    if (sn.Len != len) { NLen[k]++; return; }
++    u32 n = 12 + len; if (n > sizeof sn.Data) n = sizeof sn.Data;
++    if (addr + n > 0x2000) n = 0x2000 - addr;
++    // from the 802.11 header on (the first 12 bytes are the TX header the hardware updates), less the sequence
++    // control that TXSendFrame writes as it sends
++    for (u32 i = 12; i < n; i++)
++    {
++        if (i == 12 + 22 || i == 12 + 23) continue;
++        if (sn.Data[i] != ram[addr + i])
++        {
++            NPay[k]++;
++            if (k == 0 && NOffs < 4) Offs[NOffs++] = (int)i - 12;
++            return;
++        }
++    }
++    NOK[k]++;
++}
++
++static void Sent(const u8* ram, u16 slotreg, u16 clienttime, u32 pre)
++{
++    if (!On() || !Pending) return;
++    Pending = false;
++    static Snap now; Take(now, ram, slotreg, clienttime, pre);
++    Compare(0, SArr, now.Valid, ram, now.Addr, now.Len);
++    Compare(1, SRx, now.Valid, ram, now.Addr, now.Len);
++    NReplies++;
++    NSlotWrites += NSlotW; if (NSlotW) NSlotWriteReplies++;
++    NBufWrites += NBufW; if (NBufW) NBufWriteReplies++;
++    SArr.Have = SRx.Have = false;
++    const u64 t = Platform::GetMSCount();
++    if (!WinStart) WinStart = t;
++    if (t - WinStart >= 1000)
++    {
++        Log(LogLevel::Info, "[diag] LAN early: replies=%d validatarr=%d; arr ok=%d blank=%d pay=%d len=%d notready=%d gone=%d nosnap=%d; "
++            "rx ok=%d blank=%d pay=%d len=%d notready=%d gone=%d nosnap=%d; slot1 writes=%d in %d replies; buf writes=%d in %d replies; "
++            "pay offs=%d,%d,%d,%d\n",
++            NReplies, NValidAtArr, NOK[0], NOKBlank[0], NPay[0], NLen[0], NNotReady[0], NGone[0], NNoSnap[0],
++            NOK[1], NOKBlank[1], NPay[1], NLen[1], NNotReady[1], NGone[1], NNoSnap[1],
++            NSlotWrites, NSlotWriteReplies, NBufWrites, NBufWriteReplies,
++            NOffs > 0 ? Offs[0] : -1, NOffs > 1 ? Offs[1] : -1, NOffs > 2 ? Offs[2] : -1, NOffs > 3 ? Offs[3] : -1);
++        for (int k = 0; k < 2; k++) NOK[k] = NOKBlank[k] = NPay[k] = NLen[k] = NNotReady[k] = NGone[k] = NNoSnap[k] = 0;
++        NReplies = NSlotWrites = NSlotWriteReplies = NBufWrites = NBufWriteReplies = NValidAtArr = NOffs = 0;
++        WinStart = t;
++    }
++}
++
++static inline void SlotWrite() { if (Pending) NSlotW++; }
++static inline void RamWrite(u16 a) { if (Pending && a + 2 > BufLo && a < BufHi) NBufW++; }
++}
++
+ namespace diag
+ {
+ struct Rate { u64 Start; int N; int Held; };
+@@ -998,6 +1104,8 @@ void Wifi::SendMPReply(u16 clienttime, u16 clientmask)
+     // how does it work for default empty replies?
+     slot->Rate = 2;
+ 
++    rdiag::Sent(RAM, IOPORT(W_TXSlotReply1), clienttime, PreambleLen(2));
++
+     IOPORT(W_TXSlotReply2) = IOPORT(W_TXSlotReply1);
+     IOPORT(W_TXSlotReply1) = 0;
+ 
+@@ -1390,6 +1498,9 @@ void Wifi::StartRX()
+ 
+     RXBufferPtr = 12;
+ 
++    if (rdiag::Pending && IsMPClient && MACEqual(&RXBuffer[12 + 4], MPCmdMAC))
++        rdiag::Arrived(RAM, IOPORT(W_TXSlotReply1), *(u16*)&RXBuffer[12+24], PreambleLen(2), true);
++
+     SetIRQ(6);
+     SetStatus(6);
+     ComStatus |= 1;
+@@ -1884,6 +1995,9 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
+             u16 clienttime = *(u16*)&RXBuffer[12+24];
+             u16 clientmask = *(u16*)&RXBuffer[12+26];
+ 
++            if (IOPORT(W_AIDLow) && (clientmask & (1 << IOPORT(W_AIDLow))))
++                rdiag::Arrived(RAM, IOPORT(W_TXSlotReply1), clienttime, PreambleLen(2), false);
++
+             // include the MP reply time window
+             NextSync += 112 + ((clienttime + 10) * NumClients(clientmask));
+         }
+@@ -2327,12 +2441,15 @@ void Wifi::Write(u32 addr, u16 val)
+ 
+     if (addr >= 0x4000 && addr < 0x6000)
+     {
++        rdiag::RamWrite(addr & 0x1FFE);
+         *(u16*)&RAM[addr & 0x1FFE] = val;
+         return;
+     }
+     if (addr >= 0x2000 && addr < 0x4000)
+         return;
+ 
++    if ((addr & 0xFFF) == W_TXSlotReply1) rdiag::SlotWrite();  // (the game's own writes of the reply slot)
++
+     switch (addr)
+     {
+     case W_ModeReset:
+@@ -2545,6 +2662,7 @@ void Wifi::Write(u32 addr, u16 val)
+         }
+         if (val & 0x0080)
+         {
++            rdiag::SlotWrite();  // (W_RXCnt bit 7 latches the reply slot)
+             IOPORT(W_TXSlotReply2) = IOPORT(W_TXSlotReply1);
+             IOPORT(W_TXSlotReply1) = 0;
+         }
+@@ -2593,7 +2711,7 @@ void Wifi::Write(u32 addr, u16 val)
+         if (val & 0x0008) IOPORT(W_TXSlotLoc3) &= 0x7FFF;
+         // checkme: any bits affecting the beacon slot?
+         if (val & 0x0040) IOPORT(W_TXSlotReply2) &= 0x7FFF;
+-        if (val & 0x0080) IOPORT(W_TXSlotReply1) &= 0x7FFF;
++        if (val & 0x0080) { rdiag::SlotWrite(); IOPORT(W_TXSlotReply1) &= 0x7FFF; }
+         if ((val & 0xFF30) && (val != 0xFFFF)) Log(LogLevel::Warn, "unusual TXSLOTRESET %04X\n", val);
+         val = 0; // checkme (write-only port)
+         break;

@@ -2261,6 +2261,14 @@ void Emu::write_firmware(const melonDS::Firmware& fw) {
         Log(LogLevel::Warn, "[wifi] couldn't save the WFC settings to %s (%s)\n", wfc_path_.c_str(), strerror(errno));
 }
 
+void Emu::diag_sleep(long long us) {
+#ifdef BANANADS_LAN
+    if (local_ && us > 0) melonDS::LANDiagSleep((uint64_t)us);
+#else
+    (void)us;
+#endif
+}
+
 void Emu::run_frame() {
 #ifdef BANANADS_LAN
     if (lan_pending_.load(std::memory_order_acquire)) {  // the menu's LAN page asked for something
@@ -2275,7 +2283,16 @@ void Emu::run_frame() {
     }
     if (prof_) prof_->frame(frames_run_);  // prof.hz: on the emulator's thread, whichever runs the frames
     frames_run_++;
+#ifdef BANANADS_LAN
+    // diag-respuesta (BANANADS_LAN_TIMEOUT_MS set): the frame's RunFrame time, LAN waits inside it included
+    const auto rf0 = local_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+#endif
     nds_->RunFrame();
+#ifdef BANANADS_LAN
+    if (local_)
+        melonDS::LANDiagFrame((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - rf0).count());
+#endif
     if (debug_pc_ && frames_run_ % debug_pc_ == 0) {  // debug.pc=N: where both CPUs are, every N frames
         Log(LogLevel::Info, "[debug] frame %llu: ARM9 pc %08x lr %08x cpsr %08x halted %d | ARM7 pc %08x lr %08x "
             "cpsr %08x halted %d | POWCNT1 %04x IE %08x IF %08x\n", (unsigned long long)frames_run_,

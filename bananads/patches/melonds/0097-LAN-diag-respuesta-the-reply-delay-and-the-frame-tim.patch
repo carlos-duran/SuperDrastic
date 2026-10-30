@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carlos Duran <15650777+carlos-duran@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:12:28 -0500
+Subject: [PATCH] LAN: diag-respuesta, the reply delay and the frame time on
+ the per-second line
+
+For measuring where a lockstep frame's time goes (Mario Kart DS battles at
+~53 fps over a direct link). With BANANADS_LAN_TIMEOUT_MS set, a second
+per-second line, "[diag] LAN resp", after "[diag] LAN last":
+
+- frames, RunFrame's time (mean/p95) and that minus the LAN waits inside it,
+  the emulation (mean/p95/max), from LANDiagFrame(); the pacer's sleep in the
+  window, from LANDiagSleep() (both called by the frontend);
+- host: rtt, a MP command sent to all its replies in (the wire both ways and
+  the client's work), n/mean/p95/max; pre, the command sent to the start of
+  the wait for its replies (the host's own emulation in between);
+- client: reply, a MP command handed to its emulation to the reply sent,
+  n/mean/p95/max.
+
+steady_clock (Platform::GetUSCount) and a fixed sample buffer; nothing when
+BANANADS_LAN_TIMEOUT_MS is unset.
+---
+ src/net/LAN.cpp | 60 +++++++++++++++++++++++++++++++++++++++++++++++++
+ src/net/LAN.h   |  5 +++++
+ 2 files changed, 65 insertions(+)
+
+diff --git a/src/net/LAN.cpp b/src/net/LAN.cpp
+index 244e1d8..19933af 100644
+--- a/src/net/LAN.cpp
++++ b/src/net/LAN.cpp
+@@ -19,6 +19,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <stdlib.h>
++#include <algorithm>
+ 
+ #ifdef __WIN32__
+     #include <winsock2.h>
+@@ -75,6 +76,23 @@ static int NSendPkt, NSendCmd, NSendReply, NSendAck, NRecvPkt, NRecvHost, NHostT
+ // with BANANADS_LAN_TIMEOUT_MS set: the time blocked in RecvReplies (host) and RecvHostPacket (client)
+ static u64 WaitUS, WaitMaxUS;
+ static int NWaits, NReplyTimeout;
++// diag-respuesta: per-window samples (us): the client's CMD -> REPLY, the host's CMD -> all replies (RTT with the
++// client's work) and CMD -> start of the wait (its own work in between), the frames' RunFrame time and that minus
++// the LAN waits inside it (emulation), and the pacer's sleep
++struct Samp
++{
++    enum { N = 1024 };
++    u32 V[N]; int Count; u64 Sum; u64 Max;
++    void Add(u64 us) { if (Count < N) V[Count] = (u32)std::min<u64>(us, 0xFFFFFFFFu); Count++; Sum += us; if (us > Max) Max = us; }
++    double Mean() const { return Count ? Sum / 1000.0 / Count : 0; }
++    double P95() { int n = std::min(Count, (int)N); if (!n) return 0; int k = (n * 95) / 100; if (k >= n) k = n - 1;
++                   std::nth_element(V, V + k, V + n); return V[k] / 1000.0; }
++    void Reset() { Count = 0; Sum = 0; Max = 0; }
++};
++static Samp SReply, SRtt, SPre, SRun, SEmu;
++static u64 FrameWaitUS, SleepUS;
++static u64 CmdRecvAt, CmdSentAt;
++static int LastRecvType;
+ 
+ // BananaDS: BANANADS_LAN_TIMEOUT_MS (1-100) replaces MPRecvTimeout's 25 ms; read once, 0 when unset (or invalid)
+ static int EnvTimeoutMS()
+@@ -101,6 +119,7 @@ static void NoteWait(u64 start)
+     u64 us = Platform::GetUSCount() - start;
+     WaitUS += us; NWaits++;
+     if (us > WaitMaxUS) WaitMaxUS = us;
++    FrameWaitUS += us;
+ }
+ 
+ static bool Allow(Rate& r, int max, const char* cat)
+@@ -1139,9 +1158,21 @@ void LAN::Process()
+                     "[diag] LAN last %llu ms: sent pkt=%d cmd=%d reply=%d ack=%d; got pkt=%d host=%d; host-wait timeouts=%d; connected=%04X\n",
+                     (unsigned long long)(now - landiag::CountStart), landiag::NSendPkt, landiag::NSendCmd, landiag::NSendReply,
+                     landiag::NSendAck, landiag::NRecvPkt, landiag::NRecvHost, landiag::NHostTimeout, ConnectedBitmask);
++                if (landiag::EnvTimeoutMS())
++                    // diag-respuesta: mean/p95/max in ms
++                    Platform::Log(Platform::LogLevel::Info,
++                        "[diag] LAN resp: frames=%d run=%.2f/%.2f emu=%.2f/%.2f/%.2f sleep=%llu ms; host rtt n=%d %.2f/%.2f/%.2f pre=%.2f/%.2f; client reply n=%d %.2f/%.2f/%.2f\n",
++                        landiag::SRun.Count, landiag::SRun.Mean(), landiag::SRun.P95(),
++                        landiag::SEmu.Mean(), landiag::SEmu.P95(), landiag::SEmu.Max / 1000.0,
++                        (unsigned long long)(landiag::SleepUS / 1000),
++                        landiag::SRtt.Count, landiag::SRtt.Mean(), landiag::SRtt.P95(), landiag::SRtt.Max / 1000.0,
++                        landiag::SPre.Mean(), landiag::SPre.P95(),
++                        landiag::SReply.Count, landiag::SReply.Mean(), landiag::SReply.P95(), landiag::SReply.Max / 1000.0);
+             }
+             landiag::WaitUS = landiag::WaitMaxUS = 0;
+             landiag::NWaits = landiag::NReplyTimeout = 0;
++            landiag::SReply.Reset(); landiag::SRtt.Reset(); landiag::SPre.Reset(); landiag::SRun.Reset(); landiag::SEmu.Reset();
++            landiag::SleepUS = 0;
+             landiag::NSendPkt = landiag::NSendCmd = landiag::NSendReply = landiag::NSendAck = 0;
+             landiag::NRecvPkt = landiag::NRecvHost = landiag::NHostTimeout = 0;
+             landiag::CountStart = now;
+@@ -1325,6 +1356,7 @@ int LAN::RecvPacketGeneric(u8* packet, bool block, u64* timestamp)
+ 
+     u32 len = header->Length;
+     landiag::LastSender = (int)header->SenderID;
++    landiag::LastRecvType = (int)(header->Type & 0xFFFF);
+     if (len)
+     {
+         if (len > 2048) len = 2048;
+@@ -1368,12 +1400,18 @@ int LAN::RecvPacket(int inst, u8* packet, u64* timestamp)
+ int LAN::SendCmd(int inst, u8* packet, int len, u64 timestamp)
+ {
+     landiag::NSendCmd++;
++    if (landiag::EnvTimeoutMS()) landiag::CmdSentAt = Platform::GetUSCount();
+     return SendPacketGeneric(1, packet, len, timestamp);
+ }
+ 
+ int LAN::SendReply(int inst, u8* packet, int len, u64 timestamp, u16 aid)
+ {
+     landiag::NSendReply++;
++    if (landiag::CmdRecvAt)
++    {
++        landiag::SReply.Add(Platform::GetUSCount() - landiag::CmdRecvAt);
++        landiag::CmdRecvAt = 0;
++    }
+     return SendPacketGeneric(2 | (aid<<16), packet, len, timestamp);
+ }
+ 
+@@ -1399,8 +1437,11 @@ int LAN::RecvHostPacket(int inst, u8* packet, u64* timestamp)
+     }
+ 
+     const u64 waitstart = Platform::GetUSCount();
++    landiag::LastRecvType = -1;
+     int ret = RecvPacketGeneric(packet, true, timestamp);
+     landiag::NoteWait(waitstart);
++    // diag-respuesta: a MP command handed to the client's emulation: its reply's delay counts from here
++    if (ret > 0 && landiag::LastRecvType == 1 && landiag::EnvTimeoutMS()) landiag::CmdRecvAt = Platform::GetUSCount();
+     if (ret > 0) landiag::NRecvHost++;
+     else landiag::NHostTimeout++;
+     return ret;
+@@ -1425,6 +1466,12 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+     {
+         landiag::NoteWait(waitstart);
+         if (timedout && landiag::EnvTimeoutMS()) landiag::NReplyTimeout++;
++        if (!timedout && landiag::CmdSentAt && landiag::EnvTimeoutMS())
++        {
++            landiag::SRtt.Add(Platform::GetUSCount() - landiag::CmdSentAt);
++            landiag::SPre.Add(waitstart - landiag::CmdSentAt);
++        }
++        landiag::CmdSentAt = 0;
+         // non-MP frames (deauth, auth, association requests...) that arrived during the wait go back to the
+         // front of the queue for the regular RX path (CheckRX), in their order, instead of being thrown away
+         // (stamped as received now: the console couldn't look at them while it was blocked here)
+@@ -1575,4 +1622,17 @@ void LAN::MPNoteActivity(ENetPacket* packet)
+     }
+ }
+ 
++void LANDiagFrame(u64 runUS)
++{
++    if (!landiag::EnvTimeoutMS()) return;
++    landiag::SRun.Add(runUS);
++    landiag::SEmu.Add(runUS > landiag::FrameWaitUS ? runUS - landiag::FrameWaitUS : 0);
++    landiag::FrameWaitUS = 0;
++}
++
++void LANDiagSleep(u64 sleepUS)
++{
++    if (landiag::EnvTimeoutMS()) landiag::SleepUS += sleepUS;
++}
++
+ }
+diff --git a/src/net/LAN.h b/src/net/LAN.h
+index 441512b..7a8100f 100644
+--- a/src/net/LAN.h
++++ b/src/net/LAN.h
+@@ -42,6 +42,11 @@
+ namespace melonDS
+ {
+ 
++// BananaDS diagnostics (with BANANADS_LAN_TIMEOUT_MS set): the frontend's frame time (RunFrame, steady_clock) and its
++// pacer's sleep, reported on the per-second "[diag] LAN last" line; no-ops otherwise
++void LANDiagFrame(u64 runUS);
++void LANDiagSleep(u64 sleepUS);
++
+ class LAN : public MPInterface
+ {
+ public:

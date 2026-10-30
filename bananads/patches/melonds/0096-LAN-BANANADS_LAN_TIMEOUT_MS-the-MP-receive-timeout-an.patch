@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carlos Duran <15650777+carlos-duran@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 21:50:00 -0500
+Subject: [PATCH] LAN: BANANADS_LAN_TIMEOUT_MS, the MP receive timeout, and
+ both sides' waits
+
+For testing local wireless between two handhelds on a Wi-Fi network with
+latency spikes. The LAN host blocks up to MPRecvTimeout (25 ms) for its
+players' replies to every MP command, and a child as long for the host's
+packet; each 20-100 ms spike of the access point's two hops costs both
+consoles frames (Mario Kart DS at ~50 fps).
+
+BANANADS_LAN_TIMEOUT_MS (1-100), read once from the environment, replaces
+the 25 ms on both sides; unset (or invalid, with a warning), nothing
+changes. The effective value is logged at the Info level when a LAN
+object is made. With the variable set, the per-second "[diag] LAN last"
+line is logged at the Info level on the host and on the child, with the
+number of waits, the time blocked in them (total and longest) and the
+host's reply waits that timed out.
+---
+ src/net/LAN.cpp | 52 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/src/net/LAN.cpp b/src/net/LAN.cpp
+index 078b7ea..244e1d8 100644
+--- a/src/net/LAN.cpp
++++ b/src/net/LAN.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include <stdio.h>
+ #include <string.h>
++#include <stdlib.h>
+ 
+ #ifdef __WIN32__
+     #include <winsock2.h>
+@@ -71,6 +72,36 @@ static u16 LastBitmask = 0xFFFF;
+ // per-second counters, reported from Process()
+ static u64 CountStart = 0;
+ static int NSendPkt, NSendCmd, NSendReply, NSendAck, NRecvPkt, NRecvHost, NHostTimeout;
++// with BANANADS_LAN_TIMEOUT_MS set: the time blocked in RecvReplies (host) and RecvHostPacket (client)
++static u64 WaitUS, WaitMaxUS;
++static int NWaits, NReplyTimeout;
++
++// BananaDS: BANANADS_LAN_TIMEOUT_MS (1-100) replaces MPRecvTimeout's 25 ms; read once, 0 when unset (or invalid)
++static int EnvTimeoutMS()
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        v = 0;
++        const char* e = getenv("BANANADS_LAN_TIMEOUT_MS");
++        if (e && *e)
++        {
++            char* end = nullptr;
++            long n = strtol(e, &end, 10);
++            if (end && *end == 0 && n >= 1 && n <= 100) v = (int)n;
++            else Platform::Log(Platform::LogLevel::Warn, "LAN: BANANADS_LAN_TIMEOUT_MS=%s ignored (1-100 ms)\n", e);
++        }
++    }
++    return v;
++}
++
++static void NoteWait(u64 start)
++{
++    if (!EnvTimeoutMS()) return;
++    u64 us = Platform::GetUSCount() - start;
++    WaitUS += us; NWaits++;
++    if (us > WaitMaxUS) WaitMaxUS = us;
++}
+ 
+ static bool Allow(Rate& r, int max, const char* cat)
+ {
+@@ -172,6 +203,9 @@ LAN::LAN() noexcept : Inited(false)
+     MyMACKnown = false;
+ 
+     MPRecvTimeout = 25;
++    if (landiag::EnvTimeoutMS()) MPRecvTimeout = landiag::EnvTimeoutMS();
++    Platform::Log(Platform::LogLevel::Info, "LAN: MP receive timeout %d ms (%s)\n", MPRecvTimeout,
++        landiag::EnvTimeoutMS() ? "BANANADS_LAN_TIMEOUT_MS" : "default");
+     LastHostID = -1;
+     LastHostPeer = nullptr;
+ 
+@@ -1091,10 +1125,23 @@ void LAN::Process()
+         {
+             if (landiag::NSendPkt || landiag::NSendCmd || landiag::NSendReply || landiag::NSendAck ||
+                 landiag::NRecvPkt || landiag::NRecvHost || landiag::NHostTimeout)
++            {
++                if (landiag::EnvTimeoutMS())
++                    // both sides, at the Info level: the host's waits for replies, the client's for the host
++                    Platform::Log(Platform::LogLevel::Info,
++                        "[diag] LAN last %llu ms: sent pkt=%d cmd=%d reply=%d ack=%d; got pkt=%d host=%d; host-wait timeouts=%d; connected=%04X; waits=%d total=%llu ms max=%llu.%llu ms; reply timeouts=%d (timeout %d ms)\n",
++                        (unsigned long long)(now - landiag::CountStart), landiag::NSendPkt, landiag::NSendCmd, landiag::NSendReply,
++                        landiag::NSendAck, landiag::NRecvPkt, landiag::NRecvHost, landiag::NHostTimeout, ConnectedBitmask,
++                        landiag::NWaits, (unsigned long long)(landiag::WaitUS / 1000), (unsigned long long)(landiag::WaitMaxUS / 1000),
++                        (unsigned long long)(landiag::WaitMaxUS / 100 % 10), landiag::NReplyTimeout, MPRecvTimeout);
++                else
+                 Platform::Log(Platform::LogLevel::Debug,
+                     "[diag] LAN last %llu ms: sent pkt=%d cmd=%d reply=%d ack=%d; got pkt=%d host=%d; host-wait timeouts=%d; connected=%04X\n",
+                     (unsigned long long)(now - landiag::CountStart), landiag::NSendPkt, landiag::NSendCmd, landiag::NSendReply,
+                     landiag::NSendAck, landiag::NRecvPkt, landiag::NRecvHost, landiag::NHostTimeout, ConnectedBitmask);
++            }
++            landiag::WaitUS = landiag::WaitMaxUS = 0;
++            landiag::NWaits = landiag::NReplyTimeout = 0;
+             landiag::NSendPkt = landiag::NSendCmd = landiag::NSendReply = landiag::NSendAck = 0;
+             landiag::NRecvPkt = landiag::NRecvHost = landiag::NHostTimeout = 0;
+             landiag::CountStart = now;
+@@ -1351,7 +1398,9 @@ int LAN::RecvHostPacket(int inst, u8* packet, u64* timestamp)
+         }
+     }
+ 
++    const u64 waitstart = Platform::GetUSCount();
+     int ret = RecvPacketGeneric(packet, true, timestamp);
++    landiag::NoteWait(waitstart);
+     if (ret > 0) landiag::NRecvHost++;
+     else landiag::NHostTimeout++;
+     return ret;
+@@ -1365,6 +1414,7 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+     u16 myinstmask = 1 << MyPlayer.ID;
+     u16 alivemask = 0;                 // players a reply came from (even a late one)
+     std::vector<ENetPacket*> deferred; // non-MP frames met while waiting
++    const u64 waitstart = Platform::GetUSCount();
+ 
+     // only the LAN players that take part in local MP with us are waited for (MPActiveBitmask, see LAN.h)
+     auto waitmask = [&]() -> u16
+@@ -1373,6 +1423,8 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+     };
+     auto finish = [&](bool timedout) -> u16
+     {
++        landiag::NoteWait(waitstart);
++        if (timedout && landiag::EnvTimeoutMS()) landiag::NReplyTimeout++;
+         // non-MP frames (deauth, auth, association requests...) that arrived during the wait go back to the
+         // front of the queue for the regular RX path (CheckRX), in their order, instead of being thrown away
+         // (stamped as received now: the console couldn't look at them while it was blocked here)

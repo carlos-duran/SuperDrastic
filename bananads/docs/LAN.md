@@ -111,4 +111,37 @@ own screens) ends its session and waits; with others in it, after 30 s off. A UD
 - **0095** (LAN): a child repeats its auth/association request every frame until the parent answers (1 s at most).
   Desktop melonDS 1.0/1.1 hosting a group sleeps between its beacons and drops a frame that came while it slept,
   so a single request reached it only by chance; a parent that stays awake answers before the first copy.
-- Their "[diag]" traces log at the Debug level only (`log.level = 0`).
+- **0096** (LAN, for testing): `BANANADS_LAN_TIMEOUT_MS` (1-100, in /data/banana/bananads.env) replaces the 25 ms
+  the host waits for its players' replies to each MP command, and a child for the host (unset: 25 ms, as before).
+  The value in use is logged at startup ("LAN: MP receive timeout"); with the variable set, the per-second
+  "[diag] LAN last" line comes at the Info level on both sides, with the waits (count, total, longest) and the
+  host's reply waits that timed out.
+- **0097** (LAN, for testing, diag-respuesta): with `BANANADS_LAN_TIMEOUT_MS` set, a second per-second line,
+  "[diag] LAN resp" (times in ms, mean/p95[/max]): `frames` in the window, `run` (RunFrame's time, its LAN waits
+  included), `emu` (the same minus those waits), `sleep` (the pacer's, in the window, from the frontend); on the host
+  `rtt` (a MP command sent to all its replies in) and `pre` (the command sent to the start of that wait); on a child
+  `reply` (the host's command handed to its emulation to its reply sent).
+- **0098** (LAN, for testing, diag-respuesta-temprana; no behavior change): with `BANANADS_LAN_TIMEOUT_MS` set, a
+  child logs "[diag] LAN early" once a second: its reply slot (`W_TXSlotReply1`, the frame, its length, valid and
+  short enough for the CMD's reply time) snapshotted when the host's CMD arrives (`arr`) and when its reception starts
+  (`rx`), against what `SendMPReply` sends at the end of that reception: `ok` (the same frame, less the TX header and
+  the sequence control), `blank` (no reply either time), `pay` (another payload; `pay offs`, the first differing
+  802.11 offsets of up to 4 `arr` samples), `len`, `notready` (no valid slot then, one at the reply), `gone` (the
+  reverse), `nosnap`; `validatarr`; `slot1 writes` (of `W_TXSlotReply1`, its latch and reset included) and `buf
+  writes` (into the snapshotted frame) between the CMD's arrival and the reply, and in how many replies.
+- **0099** (LAN, respuesta-temprana; off unless `BANANADS_LAN_EARLY_REPLY=1`): a child sends its reply to the host's
+  CMD from `CheckRX` as the CMD arrives, instead of at the end of the CMD's emulated reception, built as that end
+  would: the reply slot's frame (`SendMPReply`'s checks, `TXSendFrame`'s sequence number, retry bit, WEP FCS and
+  channel), else the default empty reply, or the blank one if the CMD isn't for us; stamped with the time the
+  reception ends (`RXTimestamp` plus the CMD's air time), which the host's `RecvReplies` checks against its own
+  (the CMD's end, -32 us). The end of the reception keeps every emulated side effect but sends nothing: what it would
+  have sent is compared with what went out. "[diag] LAN early-reply", a second: what went out (`frame`, `default`,
+  `blank`), then `ok` and the mismatches (`kind`, `len`, `hdr` (bytes 0-11), `seq`, `pay`, the first `offs`),
+  `orphan` (a reception that never ended) and the late - early time stamps in us. A mismatch is never resent.
+- **0100** (LAN, respuesta-temprana): only a frame already in the reply slot, for our AID, goes out early; a default
+  or blank reply is left to the end of the reception, which sends it as without the flag. What the reply is depends
+  on the game's state at that end: Mario Kart DS's lobby ("Espera, por favor" before "Guardando") turns `W_AIDLow` 0
+  and 1 again around every CMD, and with 0099 alone 2 of 3 early blanks were frames at the end (two handhelds over
+  the direct link, 2026-10-29: the host got blanks, the session failed before "Guardando"). The diag line adds
+  `left to the reception's end default= blank=` and `early frames late as default= blank=`.
+- Their other "[diag]" traces log at the Debug level only (`log.level = 0`).

@@ -2236,10 +2236,16 @@ int run_kms(Emu& emu, const Config& cfg) {
                     aim = next;
                     aim_slips = aim_slips_next;
                     aimed = true;
+                    const long long sl0 = now_us();
                     pace.wait_until(std::chrono::steady_clock::time_point(std::chrono::microseconds(start)));
+                    emu.diag_sleep(now_us() - sl0);
                 } else aim = 0;
             } else aim = 0;
-            if (!aimed) pace.wait();  // (and the governor's signal: the frames it fell behind)
+            if (!aimed) {
+                const long long sl0 = now_us();
+                pace.wait();  // (and the governor's signal: the frames it fell behind)
+                emu.diag_sleep(now_us() - sl0);
+            }
         }
         run = false;
         pcv.notify_all();
