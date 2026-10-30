@@ -20,7 +20,7 @@ typedef struct {
 // the menu's own slots 1-8 are the emulator's savestate slots 1-8; slot 9 keeps the game from before a load (undo)
 enum { BM_UNDO_SLOT = 9 };
 
-/* the LAN multiplayer page (Quick settings > LAN multiplayer: wifi.local, melonDS's LAN), as the frontend reports it */
+/* the Local multiplayer page (Quick settings > Local multiplayer: wifi.local, melonDS's LAN), as the frontend reports it */
 enum { BM_LAN_OFF, BM_LAN_HOST, BM_LAN_JOIN, BM_LAN_AUTO, BM_LAN_MODES };   /* (the page shows Off, Auto, Host, Join) */
 /* Auto's steps: waiting for the game to turn its wifi on, looking for hosts, joining one, hosting, joined, the game
  * online (Nintendo WFC: no local session), stopped by a problem (a UDP port taken: until the game's wifi goes off and
@@ -52,6 +52,8 @@ typedef struct {
     int link_state;       /* BM_LINK_* */
     char link_ip[48];     /* up: our address on the link */
     int link_channel;     /* up: its 2.4 GHz channel (0: unknown) */
+    char link_phase[16];  /* starting: the script's phase (leaving, search, joining, starting; "" not said yet) */
+    int link_secs;        /* starting: seconds since the link began to come up */
 } bmenu_lan;
 
 typedef struct {
@@ -105,7 +107,7 @@ typedef struct {
     // it is open: 0 once the frontend has paused the game (the local game over), and the menu goes on as the paused
     // one. Called on the menu's thread; unset: never
     int (*live)(void* ctx);
-    // LAN multiplayer (Quick settings): lan_get fills st, 0 when this build has no LAN (no row). lan_set asks for a
+    // Local multiplayer (Quick settings): lan_get fills st, 0 when this build has no LAN (no row). lan_set asks for a
     // mode: BM_LAN_HOST with max_players, BM_LAN_JOIN with a host's address to join it or "" to look for hosts,
     // BM_LAN_AUTO (a session it hosts has Host's size; max_players unused), BM_LAN_OFF; the mode (not the address) is
     // kept for the next game. It returns at once: lan_get says when it is done (a join can take 5 s). Mode changes only

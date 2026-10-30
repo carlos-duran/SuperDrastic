@@ -10,11 +10,14 @@ settings are in [SETTINGS.md](SETTINGS.md) (`wifi.local`, `wifi.local_players`, 
 Desktop melonDS's own LAN dialog warns, and so does the menu's page: LAN requires low network latency to work; do
 not expect it to work through a VPN or any sort of tunnel.
 
-## The in-game menu's LAN multiplayer page (Quick settings > LAN multiplayer)
+## The in-game menu's Local multiplayer page (Quick settings > Local multiplayer)
 
-- **Connection: Router / Direct** (only when the direct link's script is there, below; changed only with the mode
-  Off, kept in `wifi.local_link`): Router plays over the Wi-Fi network the console is on; Direct links the
-  consoles without a router.
+- **Connection: Router / Direct**, the first row in every mode (only when the direct link's script is there,
+  below; changed only with the mode Off, kept in `wifi.local_link`; the cursor opens on Mode, under it): Router
+  plays over the Wi-Fi network the console is on; Direct links the consoles without a router. Direct is the
+  default when the script is there and `wifi.local_link` isn't set; a kept `router` or `direct` is respected, and
+  without the script there is no row and the console plays over its router. To play: Connection, then Mode (Host
+  on one console, Join or Auto on the others); there is no one-press shortcut.
 - **Mode: Off / Auto / Host / Join**, changed while the game runs, without a restart, and kept in `bananads.conf`
   (`wifi.local = off | auto | host | join`; `join` looks for hosts at the start, `join:<address>` joins that host
   directly). `BANANADS_WIFI_LOCAL` / `BANANADS_WIFI_LOCAL_PLAYERS` in the environment still win at each start, and
@@ -22,11 +25,16 @@ not expect it to work through a VPN or any sort of tunnel.
 - **Players** (2-16, 4 by default, `wifi.local_players`): only with Host on the Mode row; greyed, "Turn Host on to
   change it", until Host is on, and while others are in its session. Auto hosts with the same count.
 - **Hosts found** (Join only): the hosts heard on the network, with their name, players and address; A joins one
-  ("Connecting..." for up to 5 s; the page says why a join failed, and goes on looking).
+  ("Connecting..." for up to 5 s; the page says why a join failed, and goes on looking). With Direct the page is
+  **Nearby consoles**: each host by its DS name, in larger type, with its players (1/4), without its 10.42.x
+  address; empty, it says what to do on the other console (Local multiplayer, Connection Direct, Mode Host).
 - **Disconnect** (only on the Mode row of the mode that is on, Host or Join): a host's session ends; a player goes
   back to looking for hosts. Auto has none: Off leaves at once, and Auto again starts afresh.
 - A status box: what the mode is doing, the session's players with their ping, desktop melonDS's warning (with
-  Auto, Host or Join on the Mode row) and the name the others see (the DS name, Settings > Nintendo DS).
+  Auto, Host or Join on the Mode row, Router only) and the name the others see (the DS name, Settings > Nintendo
+  DS). With Direct: the link's progress while it starts (below), "In <host>'s session" and "Connecting to <host>..."
+  by the host's DS name instead of its address, and instead of the latency warning that the console has no internet
+  while the link is on.
 - Another mode picked while others are in the session (Host with a player, Join or Auto in a host's session,
   Auto hosting players) asks first ("Disconnect from Host?"; No keeps the mode). During a local wireless game only
   Off (Auto) or Disconnect works, after a question.
@@ -37,12 +45,12 @@ not expect it to work through a VPN or any sort of tunnel.
 
 ## Direct link (Connection: Direct)
 
-Not yet tested on the handhelds: it is the proof of concept (two BananaOS handhelds on an ad hoc cell, ping
-between them about halved) made into a menu option, and only the script's logic has been tried (against a mock
-of the system's tools). With Direct, Host, Join and Auto first run `link.script` (BananaLinux:
+Tried by hand on an RG DS and an RG DS Plus (BananaOS 0.5.0.1, 2026-10-29): several games played over the link,
+steadier than over the home router there. Auto with Direct, a sleep with the link up and more than two consoles
+are still untested. With Direct, Host, Join and Auto first run `link.script` (BananaLinux:
 `/usr/libexec/banana/wifi-link`; `BANANADS_LINK_SCRIPT` in the environment overrides it) as
 `/bin/sh <script> up host|join --owner <BananaDS's pid> [--channel N]` on a thread of its own, wait for it (up to
-60 s; the status box says "Starting the direct link... (up to 30 s)") and then use the link for the hosts'
+60 s; the status box shows its progress, below) and then use the link for the hosts'
 broadcasts and ENet as on a router. The script:
 
 - takes the Wi-Fi off the home network (BananaOS's `wifi down`, holding its `/run/banana/wifi.lock` while the link
@@ -68,10 +76,18 @@ broadcasts and ENet as on a router. The script:
   sees BananaDS stopped), its wpa_supplicant dying, or the supervisor itself being killed (a watchdog). A player's
   Disconnect keeps the link and looks for hosts again. Its log: `/data/banana/logs/wifi-link.log`.
 
+While the link starts, the script writes its phase in its state file (`phase=` in `/run/banana/wifi-link/state`,
+also in `wifi-link status`; reporting only, its steps and timings are unchanged), and the page shows it with the
+seconds since the link began (the Quick settings row: "Linking, N s"): `leaving` ("Leaving your Wi-Fi network...
+N s"), `search` ("Searching for the host..." for a player, "Starting the link..." for a host), `joining` ("Host
+found, joining its link..."), `starting` (a player that heard no host and starts the cell itself: "No host heard
+yet: starting the link..."); a script that writes no phase gives "Starting the direct link... N s". This display is
+checked in the menu harness (lan_direct_test) only, not yet watched on the handhelds.
+
 A link that fails (no cell after 20 s, the script failing or not answering) turns the mode Off with the reason in red; a
 link that goes away while on (two missed checks a second apart) does the same. A kept `wifi.local` other than
 `off` with Direct doesn't start the link at a game's start: the console never loses its network without a choice
-on the page. Auto with Direct, a sleep with the link up and more than two consoles are untested.
+on the page.
 
 ## Auto
 

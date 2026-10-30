@@ -182,7 +182,7 @@ void Emu::setup_wifi() {
 
 // Local wireless with another handheld (Pokémon trades and battles, Mario Kart's local races, PictoChat):
 // wifi.local = host on one, join:<the host's address> (or join: look for hosts, and pick one in the in-game menu's
-// LAN multiplayer page) on the other, or auto on both (lan_auto_tick). Both on the same network. The menu can
+// Local multiplayer page) on the other, or auto on both (lan_auto_tick). Both on the same network. The menu can
 // change it while the game runs (lan_request).
 void Emu::setup_local() {
     const std::string mode = cfg_.str("wifi.local", "off");
@@ -198,7 +198,9 @@ void Emu::setup_local() {
     {   // the direct link: BananaOS's wifi-link (link.script = BANANADS_LINK_SCRIPT for another one, to test it)
         const std::string script = cfg_.str("link.script", "/usr/libexec/banana/wifi-link");
         if (DirectLink::usable(script)) link_ = std::make_unique<DirectLink>(script, (int)cfg_.num("wifi.local_link_channel", 0));
-        link_direct_ = link_ && cfg_.str("wifi.local_link", "router") == "direct";
+        // (Direct by default when the script is there: the steadier of the two on the handhelds; a saved
+        // wifi.local_link = router still wins)
+        link_direct_ = link_ && cfg_.str("wifi.local_link", "direct") == "direct";
         std::lock_guard<std::mutex> l(lan_mu_);
         lan_st_.link_avail = link_ != nullptr;
         lan_st_.link_direct = link_direct_;
@@ -232,6 +234,15 @@ void Emu::setup_local() {
 #else
     if (mode == "off") return;
     Log(LogLevel::Warn, "[wifi] wifi.local=%s, but this build has no local wireless (BANANADS_LAN)\n", mode.c_str());
+#endif
+}
+
+bool Emu::lan_link_progress(std::string& phase, int& secs) const {
+#ifdef BANANADS_LAN
+    return link_ && link_->progress(phase, secs);
+#else
+    (void)phase; (void)secs;
+    return false;
 #endif
 }
 

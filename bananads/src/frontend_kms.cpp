@@ -1623,7 +1623,7 @@ static void mh_cheat_set(void* c, int i, int on) {
     Log(LogLevel::Info, "[cheats] %s: %s\n", mh_cheat_name(nullptr, i), on ? "on" : "off");
 }
 static void mh_log(void*, const char* line) { Log(LogLevel::Info, "%s", line); }
-// LAN multiplayer (menu.h): the emulator's LAN state for the menu's page, and the menu's picks for the emulator. The
+// Local multiplayer (menu.h): the emulator's LAN state for the menu's page, and the menu's picks for the emulator. The
 // mode and Host's size (Auto's too) are kept in bananads.conf (wifi.local, wifi.local_players) for the next game; a join
 // keeps "join" (look for hosts at the start), not the host's address, which can change. BANANADS_WIFI_LOCAL and
 // BANANADS_WIFI_LOCAL_PLAYERS (bananads.env) win over bananads.conf at each start: the page says so
@@ -1652,6 +1652,14 @@ static int mh_lan_get(void*, bmenu_lan* st) {
     st->link_state = l.link_state;
     lan_copy(st->link_ip, sizeof st->link_ip, l.link_ip);
     st->link_channel = l.link_freq >= 2412 && l.link_freq <= 2472 ? (l.link_freq - 2407) / 5 : 0;
+    {   // the link starting: the script's phase and the seconds so far
+        std::string ph;
+        int secs = 0;
+        if (l.link_state == 1 && g_lan_emu->lan_link_progress(ph, secs)) {
+            lan_copy(st->link_phase, sizeof st->link_phase, ph);
+            st->link_secs = secs;
+        }
+    }
     std::string env;
     for (const char* k : {"BANANADS_WIFI_LOCAL", "BANANADS_WIFI_LOCAL_PLAYERS", "BANANADS_WIFI_LOCAL_LINK"}) {
         const char* v = getenv(k);

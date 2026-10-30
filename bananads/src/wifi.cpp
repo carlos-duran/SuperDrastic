@@ -389,6 +389,9 @@ static uint64_t mono_ms() {
 }
 
 DirectLink::DirectLink(std::string script, int channel) : script_(std::move(script)), channel_(channel) {
+    const char* d = getenv("BANANA_LINK_DIR");
+    const char* r = getenv("BANANA_LINK_RUN");
+    dir_ = d && *d ? d : std::string(r && *r ? r : "/run/banana") + "/wifi-link";
     thr_ = std::thread([this] { worker(); });
 }
 
@@ -441,6 +444,21 @@ bool DirectLink::down_wait(int timeout_ms) {
 DirectLink::Status DirectLink::status() const {
     std::lock_guard<std::mutex> l(mu_);
     return st_;
+}
+
+bool DirectLink::progress(std::string& phase, int& secs) const {
+    const Status s = status();
+    if (s.state != State::Starting) return false;
+    secs = s.since_ms ? (int)((mono_ms() - s.since_ms) / 1000) : 0;
+    phase.clear();
+    std::ifstream f(dir_ + "/state");  // (tmpfs; the page reads it twice a second while the link starts)
+    std::string line, state;
+    while (std::getline(f, line)) {
+        if (line.rfind("phase=", 0) == 0) phase = line.substr(6);
+        else if (line.rfind("state=", 0) == 0) state = line.substr(6);
+    }
+    if (state != "starting") phase.clear();  // (a file from before this up: not ours yet)
+    return true;
 }
 
 void DirectLink::set(const Status& s) {
@@ -580,6 +598,7 @@ void DirectLink::worker() {
             n.role = cmd;
             n.ip = s.state == State::Up ? s.ip : "";
             n.freq = s.freq;
+            n.since_ms = mono_ms();
             set(n);
             std::vector<std::string> args{"up", cmd, "--owner", owner};
             if (channel_ >= 1 && channel_ <= 11) {
