@@ -875,7 +875,6 @@ static void lan_rows(void) {
     nlrows = 0;
     if (lan_link_row()) lrows[nlrows++] = LR_LINK;
     lrows[nlrows++] = LR_MODE;
-    if (lan_quick_rows()) { lrows[nlrows++] = LR_QHOST; lrows[nlrows++] = LR_QJOIN; }
     if (lan_pick == BM_LAN_HOST) lrows[nlrows++] = LR_PLAYERS;   /* (the Mode row on Host; greyed till Host is on) */
     if (lan_pick == BM_LAN_JOIN && LS.mode == BM_LAN_JOIN && LS.state != BM_LAN_READY) lrows[nlrows++] = LR_HOSTS;
     if (lan_pick == LS.mode && (LS.mode == BM_LAN_HOST || LS.mode == BM_LAN_JOIN) && LS.state == BM_LAN_READY) lrows[nlrows++] = LR_LEAVE;
@@ -1192,8 +1191,7 @@ static void draw_bottom(void) {
         }
         if (LS.no_net) {   /* the mode stays; it starts again with a network */
             snprintf(l, sizeof l, "%s", LS.msg[0] ? LS.msg : "No Wi-Fi network"); col = C_REDL;
-            auto_why = lan_quick_rows() ? "Connect in BananaOS: Settings > Network, or use Host via Direct / Join via Direct (no router)."
-                     : lan_link_row() && !lan_link_off() ? "Connect in BananaOS: Settings > Network, or pick Connection: Direct (no router)."
+            auto_why = lan_link_row() && !lan_link_off() ? "Connect in BananaOS: Settings > Network, or pick Connection: Direct (no router)."
                      : LS.mode == BM_LAN_OFF ? "Connect in BananaOS: Settings > Network."
                                              : "Connect in BananaOS: Settings > Network. The mode stays and starts again then.";
         }
@@ -1206,7 +1204,7 @@ static void draw_bottom(void) {
             else if (!strcmp(ph, "starting")) snprintf(l, sizeof l, joining ? "No host heard yet: starting the link... %d s" : "Starting the link... %d s", secs);
             else snprintf(l, sizeof l, "Starting the direct link... %d s", secs);
             auto_why = joining && (!strcmp(ph, "search") || !strcmp(ph, "starting"))
-                     ? "The other console: Host via Direct. This console leaves its Wi-Fi network meanwhile."
+                     ? "The other console: Connection Direct, Mode Host. This console leaves its Wi-Fi network meanwhile."
                      : "This console leaves its Wi-Fi network meanwhile. Do the same on the other consoles.";
         }
         else if (LS.mode == BM_LAN_AUTO) {
@@ -1302,7 +1300,7 @@ static void draw_bottom(void) {
         const int n = LS.nhosts;
         if (!n && LS.link) {   /* Direct: the other consoles on Direct too (no computer: it isn't on the link) */
             const char *l[] = { lan_linking() ? "Starting the direct link..." : "Looking for hosts...", "",
-                "On the other console: Local multiplayer,", "Host via Direct.",
+                "On the other console: Local multiplayer,", "Connection Direct, Mode Host.",
                 "No router: the consoles link directly. A host", "shows up here within a few seconds." };
             for (int i = 0; i < 6; i++)
                 text(c, i ? &F_REG : &F_MED, l[i], gx0 + S(8), gy0 + S(16) + i * S(30), i ? S(17) : S(21), i ? C_BODY : C_LIGHT, gx1 - gx0 - S(16), 0);
