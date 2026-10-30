@@ -17,6 +17,7 @@
 #include <fstream>
 #include <new>
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -147,6 +148,13 @@ void Emu::shutdown() {
     }
 #ifdef BANANADS_LAN
     lan_stop();  // at quit, before the statics go: the others hear that we leave (melonDS patch 0094)
+    if (link_ && link_used_) {
+        // the direct link down, the home Wi-Fi back: waited for up to 3 s (the script's supervisor finishes the
+        // restore by itself if it takes longer, and also when BananaDS is gone without this)
+        const bool done = link_->down_wait(3000);
+        Log(LogLevel::Info, "[wifi] direct link: %s at the quit\n", done ? "down" : "still coming down (its supervisor finishes)");
+    }
+    link_.reset();
 #endif
     if (nds_) nds_->Stop();
     export_dsi_saves();
@@ -187,8 +195,25 @@ void Emu::setup_local() {
     }
     lan_read_test_modes();
     lan_st_built_ = true;
+    {   // the direct link: BananaOS's wifi-link (link.script = BANANADS_LINK_SCRIPT for another one, to test it)
+        const std::string script = cfg_.str("link.script", "/usr/libexec/banana/wifi-link");
+        if (DirectLink::usable(script)) link_ = std::make_unique<DirectLink>(script, (int)cfg_.num("wifi.local_link_channel", 0));
+        link_direct_ = link_ && cfg_.str("wifi.local_link", "router") == "direct";
+        std::lock_guard<std::mutex> l(lan_mu_);
+        lan_st_.link_avail = link_ != nullptr;
+        lan_st_.link_direct = link_direct_;
+    }
+    if (link_)
+        Log(LogLevel::Info, "[wifi] local wireless connection: %s (direct link: %s)\n", link_direct_ ? "direct" : "router",
+            link_->script().c_str());
     lan_net_check(true);
     if (mode == "off") return;
+    if (link_direct_) {
+        // Direct takes the console off its Wi-Fi network: only when picked on the LAN page, never by itself at a start
+        Log(LogLevel::Info, "[wifi] local wireless %s with the direct link: not started at the start (pick it on the LAN page)\n",
+            mode.c_str());
+        return;
+    }
     const bool manual = mode == "host" || mode == "join" || mode.rfind("join:", 0) == 0;
     if (manual && lan_net_wait(mode == "host" ? LanMode::Host : LanMode::Join, mode.size() > 5 ? mode.substr(5) : "",
                                lan_status().max_players))
@@ -239,6 +264,20 @@ void Emu::lan_request(LanMode mode, const std::string& addr, int max_players) {
     lan_pending_.store(true, std::memory_order_release);
 }
 
+void Emu::lan_link_request(bool direct) {
+    std::lock_guard<std::mutex> l(lan_mu_);
+    if (!lan_st_.built || !lan_st_.link_avail) return;
+    LanReq r{LanMode::Off, "", 0};
+    r.link = direct ? 1 : 0;
+    lan_req_.push_back(r);
+    if (lan_st_.mode == LanMode::Off) {  // (what the menu shows until the emulator's thread has done it)
+        lan_st_.link_direct = direct;
+        if (lan_st_.state == LanState::Failed) lan_st_.state = LanState::Idle;
+        lan_st_.msg.clear();
+    }
+    lan_pending_.store(true, std::memory_order_release);
+}
+
 void Emu::lan_apply() {
     if (!lan_pending_.exchange(false, std::memory_order_acq_rel)) return;
     std::vector<LanReq> rs;
@@ -251,6 +290,11 @@ void Emu::lan_apply() {
 
 void Emu::lan_apply_one(const LanReq& r) {
 #ifdef BANANADS_LAN
+    if (r.link >= 0) {
+        lan_link_set(r.link == 1);
+        lan_refresh(true);
+        return;
+    }
     // Auto has no Disconnect: Off leaves (melonDS patch 0094: the others hear it at once), Auto again starts afresh.
     // A pause until the game's wifi went off and on couldn't tell MKDS's "Create group" (its wifi off for 3 s or more,
     // in its multiplayer menu) from its main menu and straight back (under 3 s).
@@ -268,6 +312,7 @@ void Emu::lan_apply_one(const LanReq& r) {
             }
             Log(LogLevel::Info, "[wifi] local wireless auto: on\n");
             lan_auto_phase(AutoPhase::Wait);
+            if (link_direct_) lan_link_ready(r);  // (Auto starts once it is up: net_ok_)
             lan_auto_tick();
         }
         lan_refresh(true);
@@ -275,7 +320,15 @@ void Emu::lan_apply_one(const LanReq& r) {
     }
     auto_on_ = false;
     lan_stop();
-    if (r.mode != LanMode::Off && lan_net_wait(r.mode, r.addr, r.max_players)) {
+    if (link_direct_) {
+        if (r.mode == LanMode::Off) {  // the home Wi-Fi back
+            link_wait_ = false;
+            if (link_ && link_->status().state != DirectLink::State::Down) link_->down();
+        } else if (!lan_link_ready(r)) {  // (it starts once the link is up: lan_link_tick)
+            lan_refresh(true);
+            return;
+        }
+    } else if (r.mode != LanMode::Off && lan_net_wait(r.mode, r.addr, r.max_players)) {
         lan_refresh(true);
         return;
     }
@@ -327,6 +380,20 @@ void Emu::lan_net_check(bool now) {
     const uint64_t t = now_us();
     if (!now && t - net_check_us_ < 1000000) return;
     net_check_us_ = t;
+    if (link_direct_) {
+        // Direct: the home Wi-Fi doesn't matter; the link does (up, and our address still there: a sleep, or
+        // anything else that took it down, ends the mode)
+        const DirectLink::Status ls = link_->status();
+        const bool up = ls.state == DirectLink::State::Up;
+        if (up && !lan_link_addr()) {
+            if (++link_gone_ >= 2) lan_link_lost("The direct link went down (sleep, or the Wi-Fi changed)");
+        } else
+            link_gone_ = 0;
+        net_ok_ = up && link_gone_ == 0;
+        std::lock_guard<std::mutex> l(lan_mu_);
+        lan_st_.no_net = false;
+        return;
+    }
     const std::string net = usable_net();
     const bool ok = !net.empty();
     if (ok == net_ok_ && !now) return;
@@ -384,6 +451,145 @@ bool Emu::lan_net_wait(LanMode mode, const std::string& addr, int max_players) {
     lan_st_.players.clear();
     lan_st_.hosts.clear();
     return true;
+}
+
+// ---- the direct link (wifi.local_link = direct) ----
+// Host, Join and Auto with Connection Direct: the link up first (DirectLink, on its own thread: 5-25 s), for the
+// role (host: 10.42.0.1; join and Auto: an address from the MAC), then the session as on a Wi-Fi network; the menu
+// shows Busy meanwhile. Off (Disconnect as a host, Auto's Off), Router, a failure and the quit bring it down, and
+// the script puts the home Wi-Fi back. A failed or lost link turns the mode Off, with the reason on the page (the
+// Mode row still on the mode picked: A tries again). Discovery and ENet need nothing else: the link's address and
+// a default route on wlan0 carry the 255.255.255.255 beacons.
+static uint32_t ipv4_of(const std::string& s) {
+    in_addr a;
+    return inet_pton(AF_INET, s.c_str(), &a) == 1 ? ntohl(a.s_addr) : 0;
+}
+
+bool Emu::lan_link_addr() const {
+    const uint32_t want = ipv4_of(link_->status().ip);
+    if (!want) return false;
+    struct ifaddrs* ifs = nullptr;
+    if (getifaddrs(&ifs) != 0) return true;  // (can't tell: taken as there)
+    bool found = false;
+    for (struct ifaddrs* i = ifs; i && !found; i = i->ifa_next)
+        if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET && (i->ifa_flags & IFF_UP) &&
+            ntohl(reinterpret_cast<sockaddr_in*>(i->ifa_addr)->sin_addr.s_addr) == want)
+            found = true;
+    freeifaddrs(ifs);
+    return found;
+}
+
+bool Emu::lan_link_ready(const LanReq& r) {
+    const std::string role = r.mode == LanMode::Host ? "host" : "join";
+    const DirectLink::Status ls = link_->status();
+    if (ls.state == DirectLink::State::Up && ls.role == role && !link_wait_) {
+        net_ok_ = true;
+        return true;
+    }
+    Log(LogLevel::Info, "[wifi] direct link: up as %s for %s\n", role.c_str(),
+        r.mode == LanMode::Host ? "host" : r.mode == LanMode::Join ? "join" : "auto");
+    link_used_ = true;
+    link_wait_ = true;
+    link_req_ = r;
+    link_->up(role);
+    net_ok_ = false;
+    std::lock_guard<std::mutex> l(lan_mu_);
+    lan_st_.mode = r.mode;
+    if (r.mode != LanMode::Auto) lan_st_.state = LanState::Busy;
+    lan_st_.msg.clear();
+    lan_st_.addr = r.mode == LanMode::Join ? r.addr : "";
+    if (r.mode == LanMode::Host && r.max_players >= 2) lan_st_.max_players = r.max_players;
+    lan_st_.players.clear();
+    lan_st_.hosts.clear();
+    lan_st_.link_state = (int)DirectLink::State::Starting;
+    return false;
+}
+
+void Emu::lan_link_lost(const std::string& why) {
+    Log(LogLevel::Warn, "[wifi] direct link: %s: local wireless off\n", why.c_str());
+    lan_stop();
+    auto_on_ = false;
+    link_wait_ = false;
+    link_gone_ = 0;
+    net_ok_ = false;
+    if (link_->status().state != DirectLink::State::Down) link_->down();
+    std::lock_guard<std::mutex> l(lan_mu_);
+    lan_st_.mode = LanMode::Off;
+    lan_st_.state = LanState::Failed;
+    lan_st_.msg = why;
+    lan_st_.addr.clear();
+    lan_st_.players.clear();
+    lan_st_.hosts.clear();
+}
+
+void Emu::lan_link_tick() {
+    if (!link_) return;
+    const uint32_t g = link_->generation();
+    if (g == link_gen_) return;
+    link_gen_ = g;
+    const DirectLink::Status ls = link_->status();
+    {
+        std::lock_guard<std::mutex> l(lan_mu_);
+        lan_st_.link_state = (int)ls.state;
+        lan_st_.link_ip = ls.state == DirectLink::State::Up ? ls.ip : "";
+        lan_st_.link_freq = ls.freq;
+    }
+    if (!link_direct_) return;
+    switch (ls.state) {
+        case DirectLink::State::Up: {
+            net_ok_ = true;
+            link_gone_ = 0;
+            if (!link_wait_) break;
+            link_wait_ = false;
+            const LanReq r = link_req_;
+            switch (r.mode) {
+                case LanMode::Host: lan_start_host(r.max_players); break;
+                case LanMode::Join:
+                    if (r.addr.empty()) lan_start_find("", "");
+                    else lan_start_join(r.addr);
+                    break;
+                default: break;  // Auto: its tick goes on now that there is a network (net_ok_)
+            }
+            lan_refresh(true);
+            break;
+        }
+        case DirectLink::State::Failed:
+            net_ok_ = false;
+            if (link_wait_ || auto_on_ || lan_status().mode != LanMode::Off)
+                lan_link_lost("Direct link failed: " + ls.msg);
+            break;
+        case DirectLink::State::Down:
+            net_ok_ = false;
+            if (!link_wait_ && (auto_on_ || lan_status().mode != LanMode::Off))
+                lan_link_lost("The direct link went down");
+            break;
+        default:
+            net_ok_ = false;
+            break;
+    }
+}
+
+void Emu::lan_link_set(bool direct) {
+    if (!link_ || direct == link_direct_) return;
+    if (auto_on_ || local_ || lan_status().mode != LanMode::Off) {
+        Log(LogLevel::Warn, "[wifi] local wireless connection: changed only with the mode Off\n");
+        std::lock_guard<std::mutex> l(lan_mu_);
+        lan_st_.link_direct = link_direct_;
+        return;
+    }
+    link_direct_ = direct;
+    link_wait_ = false;
+    link_gone_ = 0;
+    if (!direct && link_->status().state != DirectLink::State::Down) link_->down();
+    Log(LogLevel::Info, "[wifi] local wireless connection: %s\n", direct ? "direct (no router)" : "router (the Wi-Fi network)");
+    {
+        std::lock_guard<std::mutex> l(lan_mu_);
+        lan_st_.link_direct = direct;
+        if (lan_st_.state == LanState::Failed) lan_st_.state = LanState::Idle;
+        lan_st_.msg.clear();
+    }
+    net_ok_ = !direct;  // (Router: the check below sees whether there is a network, and says so if not)
+    lan_net_check(true);
 }
 
 static LAN& lan_iface() {
@@ -2019,6 +2225,7 @@ void Emu::service_net() {
 #ifdef BANANADS_LAN
     std::lock_guard<std::mutex> g(net_mu_);
     lan_apply();
+    lan_link_tick();
     lan_net_check(false);
     if (local_) MPInterface::Get().Process();
     update_mp_active();
@@ -2120,6 +2327,10 @@ void Emu::run_frame() {
         lan_refresh(false);
     }
 #ifdef BANANADS_LAN
+    if (link_ && link_->generation() != link_gen_) {  // the direct link's status changed
+        std::lock_guard<std::mutex> g(net_mu_);
+        lan_link_tick();
+    }
     if (lan_st_built_ && now_us() - net_check_us_ >= 1000000) {  // a network to play on (every 1 s)
         std::lock_guard<std::mutex> g(net_mu_);
         lan_net_check(false);

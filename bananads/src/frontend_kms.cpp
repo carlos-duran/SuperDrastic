@@ -1647,8 +1647,13 @@ static int mh_lan_get(void*, bmenu_lan* st) {
     lan_copy(st->name, sizeof st->name, g_lan_emu->cfg().str("firmware.nickname", "BananaDS"));
     lan_copy(st->addr, sizeof st->addr, l.addr);
     lan_copy(st->msg, sizeof st->msg, l.msg);
+    st->link_avail = l.link_avail;
+    st->link = l.link_direct;
+    st->link_state = l.link_state;
+    lan_copy(st->link_ip, sizeof st->link_ip, l.link_ip);
+    st->link_channel = l.link_freq >= 2412 && l.link_freq <= 2472 ? (l.link_freq - 2407) / 5 : 0;
     std::string env;
-    for (const char* k : {"BANANADS_WIFI_LOCAL", "BANANADS_WIFI_LOCAL_PLAYERS"}) {
+    for (const char* k : {"BANANADS_WIFI_LOCAL", "BANANADS_WIFI_LOCAL_PLAYERS", "BANANADS_WIFI_LOCAL_LINK"}) {
         const char* v = getenv(k);
         if (v && *v) env += (env.empty() ? "" : ", ") + std::string(k);
     }
@@ -1678,6 +1683,12 @@ static void mh_lan_set(void*, int mode, int max_players, const char* addr) {
                          : m == Emu::LanMode::Auto ? "auto" : "off");
     if (m == Emu::LanMode::Host && max_players >= 2)  // (Auto hosts with Host's size: nothing of its own)
         save_opt("wifi.local_players", std::to_string(max_players));
+}
+// Connection: Router / Direct, kept in bananads.conf (wifi.local_link); a saved Direct never starts a mode by itself
+static void mh_lan_link_set(void*, int direct) {
+    if (!g_lan_emu) return;
+    g_lan_emu->lan_link_request(direct != 0);
+    save_opt("wifi.local_link", direct ? "direct" : "router");
 }
 
 // ---- the frontend ---------------------------------------------------------------------------------------------
@@ -1884,6 +1895,7 @@ int run_kms(Emu& emu, const Config& cfg) {
         g_lan_emu = &emu;
         h.lan_get = mh_lan_get;
         h.lan_set = mh_lan_set;
+        h.lan_link_set = mh_lan_link_set;
         start_mark("menu options");
         bmenu_init(&h);
         start_mark("menu init");

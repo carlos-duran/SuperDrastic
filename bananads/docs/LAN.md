@@ -4,13 +4,17 @@ BananaDS plays a DS game's local wireless (tested with Mario Kart DS's local gro
 handhelds, or a handheld and desktop melonDS 1.0/1.1, on the same Wi-Fi network, through melonDS's LAN (ENet, UDP
 7064 for the game and 7063 for the hosts' broadcasts, once a second). It needs `-DBANANADS_LAN=ON` and libenet
 (BananaLinux builds it so); local wireless stays off until `wifi.local` or the in-game menu asks for it. The
-settings are in [SETTINGS.md](SETTINGS.md) (`wifi.local`, `wifi.local_players`, `firmware.nickname`).
+settings are in [SETTINGS.md](SETTINGS.md) (`wifi.local`, `wifi.local_players`, `wifi.local_link`,
+`firmware.nickname`). Without a router, the consoles can also link directly (Connection: Direct, below).
 
 Desktop melonDS's own LAN dialog warns, and so does the menu's page: LAN requires low network latency to work; do
 not expect it to work through a VPN or any sort of tunnel.
 
 ## The in-game menu's LAN multiplayer page (Quick settings > LAN multiplayer)
 
+- **Connection: Router / Direct** (only when the direct link's script is there, below; changed only with the mode
+  Off, kept in `wifi.local_link`): Router plays over the Wi-Fi network the console is on; Direct links the
+  consoles without a router.
 - **Mode: Off / Auto / Host / Join**, changed while the game runs, without a restart, and kept in `bananads.conf`
   (`wifi.local = off | auto | host | join`; `join` looks for hosts at the start, `join:<address>` joins that host
   directly). `BANANADS_WIFI_LOCAL` / `BANANADS_WIFI_LOCAL_PLAYERS` in the environment still win at each start, and
@@ -28,7 +32,46 @@ not expect it to work through a VPN or any sort of tunnel.
   Off (Auto) or Disconnect works, after a question.
 - Without a network (an interface up and running with an IPv4 address, looked for every second) nothing starts:
   Quick settings' row says "No Wi-Fi" and doesn't open, the mode is kept, and it starts again when the network is
-  back. A session ends when the network goes. Nintendo WFC (slirp) isn't affected.
+  back. A session ends when the network goes. Nintendo WFC (slirp) isn't affected. With a Connection row the page
+  opens anyway, as Direct needs no network.
+
+## Direct link (Connection: Direct)
+
+Not yet tested on the handhelds: it is the proof of concept (two BananaOS handhelds on an ad hoc cell, ping
+between them about halved) made into a menu option, and only the script's logic has been tried (against a mock
+of the system's tools). With Direct, Host, Join and Auto first run `link.script` (BananaLinux:
+`/usr/libexec/banana/wifi-link`; `BANANADS_LINK_SCRIPT` in the environment overrides it) as
+`/bin/sh <script> up host|join --owner <BananaDS's pid> [--channel N]` on a thread of its own, wait for it (up to
+60 s; the status box says "Starting the direct link... (up to 30 s)") and then use the link for the hosts'
+broadcasts and ENet as on a router. The script:
+
+- takes the Wi-Fi off the home network (BananaOS's `wifi down`, holding its `/run/banana/wifi.lock` while the link
+  is up) and joins or starts an IBSS ("ad hoc") cell: SSID `bananalink`, BSSID 02:42:4E:41:00:01, 2.4 GHz channel 1
+  (`wifi.local_link_channel` 1-11, or `CHANNEL=` in `/data/banana/wifi-link.conf`). Every console must use the same
+  channel.
+- No DHCP: the host takes 10.42.0.1/16 (another address if it is taken), a player 10.42.A.B made from its wlan0
+  MAC (A, B 1-254), each checked first with an ARP probe and moved on a clash, so 4-16 consoles don't collide. A
+  default route on wlan0 (no gateway) lets the broadcasts out.
+- The cell is looked for before it is joined (its own scans until a fresh beacon of the BSSID: a player up to 15 s,
+  a host 3 s), and a player checks every 10 s that the host (10.42.0.1) answers an ARP request; while it doesn't,
+  it leaves the cell, looks for it again (35 s at most) and joins again. With both consoles busy with the game,
+  mac80211's own two short scans can miss the host's cell; it then starts one of its own with the same BSSID, which
+  it never merges and which may not hear the host (the first test on the handhelds: "looking for hosts" for good).
+- A host that receives nothing starts its cell again every 20 s. Alone for 30 s, mac80211 scans for a cell to
+  merge with, and on these handhelds (rtw88_8821cs) the host's cell is then no longer heard: a player that comes
+  later starts its own and never gets the host's discovery broadcasts, though ARP and ping still pass (the second
+  test on the handhelds, 2026-10-29). A player's own cell, if it started one, is adopted at the next start.
+- Open cell: BananaOS's wpa_supplicant is built without IBSS RSN, so the cell is not encrypted and anyone in
+  reach can join it while it is up. The console has no internet meanwhile (the page says so).
+- Puts the home Wi-Fi back (only if it was up before) on Off, a host's Disconnect, Router, quitting the game,
+  BananaDS crashing (a supervisor watches its pid), a sleep (BananaOS's sleep.d `05-wifi-link`, and the supervisor
+  sees BananaDS stopped), its wpa_supplicant dying, or the supervisor itself being killed (a watchdog). A player's
+  Disconnect keeps the link and looks for hosts again. Its log: `/data/banana/logs/wifi-link.log`.
+
+A link that fails (no cell after 20 s, the script failing or not answering) turns the mode Off with the reason in red; a
+link that goes away while on (two missed checks a second apart) does the same. A kept `wifi.local` other than
+`off` with Direct doesn't start the link at a game's start: the console never loses its network without a choice
+on the page. Auto with Direct, a sleep with the link up and more than two consoles are untested.
 
 ## Auto
 

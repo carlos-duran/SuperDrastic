@@ -27,6 +27,8 @@ enum { BM_LAN_OFF, BM_LAN_HOST, BM_LAN_JOIN, BM_LAN_AUTO, BM_LAN_MODES };   /* (
  * on, or Off then Auto) */
 enum { BM_AUTO_WAIT, BM_AUTO_SEARCH, BM_AUTO_JOINING, BM_AUTO_HOST, BM_AUTO_JOINED, BM_AUTO_ONLINE, BM_AUTO_HELD };
 enum { BM_LAN_IDLE, BM_LAN_BUSY, BM_LAN_READY, BM_LAN_FAILED };  /* idle: off or looking for hosts; ready: hosting or joined */
+/* the direct link (Connection: Direct): coming up, up, coming down (the home Wi-Fi back), failed */
+enum { BM_LINK_DOWN, BM_LINK_STARTING, BM_LINK_UP, BM_LINK_STOPPING, BM_LINK_FAILED };
 #define BM_LAN_MAX 16
 typedef struct {
     int mode, state;      /* BM_LAN_* */
@@ -43,6 +45,13 @@ typedef struct {
     int untagged;         /* auto, joined: the host doesn't say its game (desktop melonDS) */
     int no_net;           /* no network (Wi-Fi off or not connected): nothing starts; the mode is kept */
     int host_players;     /* Host's size (wifi.local_players, 2-16): a session Host or Auto starts */
+    /* Connection (wifi.local_link): Router (this Wi-Fi network) or Direct (the consoles linked without a router,
+     * BananaOS's wifi-link; this console off its Wi-Fi network, so without internet, while it is up) */
+    int link_avail;       /* Direct can be picked (its script is there): the page has a Connection row */
+    int link;             /* 1: Direct */
+    int link_state;       /* BM_LINK_* */
+    char link_ip[48];     /* up: our address on the link */
+    int link_channel;     /* up: its 2.4 GHz channel (0: unknown) */
 } bmenu_lan;
 
 typedef struct {
@@ -103,6 +112,9 @@ typedef struct {
     // outside a local wireless game (mp_lock, live), but for Off from Auto: the menu sees to it
     int (*lan_get)(void* ctx, bmenu_lan* st);
     void (*lan_set)(void* ctx, int mode, int max_players, const char* addr);
+    // Connection: 1 Direct, 0 Router; kept for the next game (wifi.local_link). Only with the mode Off (the menu sees
+    // to it); Direct's link comes up when Host, Join or Auto starts. Unset: no Connection row
+    void (*lan_link_set)(void* ctx, int direct);
 } bmenu_host;
 
 void bmenu_init(const bmenu_host* host);  // once, before the first bmenu_run
